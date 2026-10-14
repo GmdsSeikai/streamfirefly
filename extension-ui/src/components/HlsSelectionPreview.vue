@@ -16,7 +16,7 @@ const PREPARE_TIMEOUT_MS = 15000;
 const REPLAY_HEADERS = ["referer", "origin", "authorization", "cookie", "user-agent"];
 const STATE_LABELS: Record<PreviewState, string> = { idle: "未开始", preparing: "准备中", playing: "播放中", paused: "已暂停", ended: "已到终点", failed: "预览失败" };
 
-const props = defineProps<{ snapshot: HlsSelectionSnapshot | null; loadTrack: (track: HlsTrack) => Promise<HlsManifest>; poster?: string | null; canStart?: boolean }>();
+const props = defineProps<{ snapshot: HlsSelectionSnapshot | null; loadTrack: (track: HlsTrack, options?: { restrictOrigin?: boolean }) => Promise<HlsManifest>; poster?: string | null; canStart?: boolean }>();
 const emit = defineEmits<{ start: [] }>();
 
 interface PreviewRun {
@@ -263,7 +263,7 @@ function startSession(snapshot: HlsSelectionSnapshot) {
 async function prepareRun(run: PreviewRun) {
   try {
     const track = run.snapshot.audioTrack;
-    const audioManifest = track ? await props.loadTrack(track) : null;
+    const audioManifest = track ? await props.loadTrack(track, { restrictOrigin: true }) : null;
     if (!live(run)) throw new Error(STALE);
     const plan = await buildHlsPlan(planSelectionFor(run.snapshot, { audioManifest, container: run.snapshot.output.container }));
     if (!live(run)) throw new Error(STALE);

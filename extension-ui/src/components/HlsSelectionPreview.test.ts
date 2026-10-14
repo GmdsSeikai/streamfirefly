@@ -85,6 +85,15 @@ function makeSnapshot(overrides: Partial<HlsSelectionSnapshot> = {}): HlsSelecti
 }
 
 describe("HLS selection preview player", () => {
+  it("requests its audio manifest with candidate-origin credentials only", async () => {
+    const snapshot = makeSnapshot();
+    const loader = vi.fn(loadTrack);
+    const wrapper = mount(HlsSelectionPreview, { props: { snapshot, loadTrack: loader } });
+    try {
+      await flushPromises();
+      expect(loader).toHaveBeenCalledWith(snapshot.audioTrack, { restrictOrigin: true });
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
   beforeEach(() => {
     sent.length = 0;
     trackCalls.length = 0;

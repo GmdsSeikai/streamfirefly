@@ -253,8 +253,112 @@ function startServer() {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server)));
 }
 
+// An isolated real extension checks the network boundary separately from the media fixtures.
+async function verifyExtensionAuth() {
+  const seenA = [], seenB = [], servers = [];
+  let context, originB;
+  const serve = log => (request, response) => {
+    log.push({ url: request.url, authorization: request.headers.authorization || null, referer: request.headers.referer || null, cookie: request.headers.cookie || null });
+    if (request.url === '/redirect') { response.writeHead(302, { location: `${originB}/redirected.m3u8` }); response.end(); return; }
+    if (request.url === '/page.html') { response.end('<!doctype html><title>preview auth fixture</title>'); return; }
+    const status = request.url === '/protected.m3u8' && request.headers.authorization !== 'Bearer preview-fixture' ? 403 : 200;
+    response.writeHead(status, { 'content-type': 'application/vnd.apple.mpegurl', 'access-control-allow-origin': '*' });
+    response.end('#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nseg.ts\n#EXT-X-ENDLIST\n');
+  };
+  try {
+    for (const log of [seenA, seenB]) {
+      const server = http.createServer(serve(log));
+      servers.push(server);
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+    }
+    const originA = `http://127.0.0.1:${servers[0].address().port}`;
+    originB = `http://127.0.0.1:${servers[1].address().port}`;
+    const extension = fs.mkdtempSync(path.join(archive, 'auth-extension-'));
+    fs.cpSync(path.join(root, 'extension'), extension, { recursive: true });
+    context = await chromium.launchPersistentContext(fs.mkdtempSync(path.join(archive, 'auth-profile-')), {
+      channel: 'chromium', headless: true, args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`]
+    });
+    const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout: 15000 });
+    const extensionId = new URL(worker.url()).host;
+    const page = await context.newPage();
+    await page.goto(`${originA}/page.html`);
+    const options = await context.newPage();
+    await options.goto(`chrome-extension://${extensionId}/dist/app.html?surface=options`);
+    const outcome = await options.evaluate(async ({ originA, originB }) => {
+      await chrome.storage.local.set({ sniffMode: 'always' });
+      const tabId = (await chrome.tabs.query({ url: `${originA}/*` }))[0]?.id;
+      if (!tabId) throw new Error('fixture source tab missing');
+      const send = async message => (await chrome.scripting.executeScript({
+        target: { tabId }, world: 'ISOLATED', func: value => chrome.runtime.sendMessage(value), args: [message]
+      }))[0].result;
+      await send({ type: 'media.sniffing.set', tabId, payload: { paused: false } });
+      const candidateId = `${originA}/master.m3u8`;
+      const headers = { authorization: 'Bearer preview-fixture', referer: `${originA}/`, cookie: 'candidate=private' };
+      const add = await send({ type: 'media.add', candidate: { url: candidateId, mime: 'application/vnd.apple.mpegurl', source: 'network', requestHeaders: headers } });
+      if (!add?.ok) throw new Error('fixture candidate registration failed');
+      const manifest = (url, restricted = true) => send({ type: 'media.fetchText', id: candidateId, url, ...(restricted ? { restrictOrigin: true } : {}) });
+      const same = await manifest(`${originA}/same.m3u8`);
+      const cross = await manifest(`${originB}/public.m3u8`);
+      const protectedCross = await manifest(`${originB}/protected.m3u8`);
+      const redirect = await manifest(`${originA}/redirect`);
+      const legacy = await manifest(`${originB}/legacy.m3u8`, false);
+      const apply = await send({ type: 'preview.headers.apply', payload: { previewSessionId: 'auth-boundary', candidateId, url: candidateId, headers } });
+      await chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', func: async (a, b) => {
+        await fetch(`${a}/dnr.m3u8`);
+        await fetch(`${b}/dnr.m3u8`);
+      }, args: [originA, originB] });
+      const clear = await send({ type: 'preview.headers.clear', previewSessionId: 'auth-boundary' });
+      const rulesAfterClear = (await chrome.declarativeNetRequest.getSessionRules()).length;
+      const active = await send({ type: 'preview.headers.apply', payload: { previewSessionId: 'auth-close', candidateId, url: candidateId, headers } });
+      const rulesBeforeClose = (await chrome.declarativeNetRequest.getSessionRules()).length;
+      await chrome.tabs.remove(tabId);
+      const deadline = Date.now() + 5000;
+      let rulesAfterClose;
+      do {
+        rulesAfterClose = (await chrome.declarativeNetRequest.getSessionRules()).length;
+        if (!rulesAfterClose) break;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      } while (Date.now() < deadline);
+      return { same, cross, protectedCross, redirect, legacy, apply, clear, active, rulesAfterClear, rulesBeforeClose, rulesAfterClose };
+    }, { originA, originB });
+    const request = (log, url) => log.find(item => item.url === url);
+    const clean = item => item && !item.authorization && !item.referer && !item.cookie;
+    const same = request(seenA, '/same.m3u8'), cross = request(seenB, '/public.m3u8');
+    const protectedCross = request(seenB, '/protected.m3u8'), redirect = request(seenB, '/redirected.m3u8');
+    const legacy = request(seenB, '/legacy.m3u8'), dnrA = request(seenA, '/dnr.m3u8'), dnrB = request(seenB, '/dnr.m3u8');
+    return [
+      { name: '真实扩展：同源预览保留候选鉴权', ok: outcome.same.ok && same?.authorization === 'Bearer preview-fixture' && same?.referer === `${originA}/`, evidence: same },
+      { name: '真实扩展：跨源公开音轨不带候选凭据', ok: outcome.cross.ok && clean(cross), evidence: cross },
+      { name: '真实扩展：跨源鉴权失败不转发凭据', ok: outcome.protectedCross.status === 403 && clean(protectedCross), evidence: { result: outcome.protectedCross, request: protectedCross } },
+      { name: '真实扩展：跨源重定向不注入候选头部', ok: outcome.redirect.ok && clean(redirect), evidence: redirect },
+      { name: '真实扩展：下载默认鉴权语义保持', ok: outcome.legacy.ok && legacy?.authorization === 'Bearer preview-fixture', evidence: legacy },
+      { name: '真实 DNR：候选 Authorization/Cookie 限定 origin', ok: outcome.apply.ok && dnrA?.cookie === 'candidate=private' && dnrA?.authorization === 'Bearer preview-fixture' && !dnrB?.authorization && !dnrB?.cookie, evidence: { same: dnrA, cross: dnrB } },
+      { name: '真实 DNR：显式清理及活跃规则关 tab 清理', ok: outcome.clear.ok && outcome.active.ok && outcome.rulesAfterClear === 0 && outcome.rulesBeforeClose === 1 && outcome.rulesAfterClose === 0, evidence: { afterClear: outcome.rulesAfterClear, beforeClose: outcome.rulesBeforeClose, afterClose: outcome.rulesAfterClose } }
+    ];
+  } finally {
+    try { await context?.close(); }
+    finally { for (const server of servers) if (server.listening) await new Promise(resolve => server.close(resolve)); }
+  }
+}
+
+function writeReport(errors = [], origin = null) {
+  const passed = results.filter(item => item.status === 'passed').length;
+  const failed = results.length - passed;
+  const report = { passed, failed, succeeded: failed === 0 && passed > 0, browser: browserName, startedAt: new Date().toISOString(), results, errors, origin };
+  fs.writeFileSync(resultPath, JSON.stringify(report, null, 2));
+  fs.writeFileSync(path.join(archive, `result-${browserName}.json`), JSON.stringify(report, null, 2));
+  console.log(`\n${passed} checks passed, ${failed} failed → ${resultPath}`);
+  if (!report.succeeded) process.exitCode = 1;
+}
+
 async function main() {
   if (!fs.existsSync(path.join(root, 'extension/dist/app.html'))) throw new Error('extension/dist 不存在，请先运行 npm run build:extension 或 npm run validate:extension');
+  if (process.argv.includes('--auth-only')) {
+    if (browserName !== 'chromium') throw new Error('--auth-only 需要 Chromium 扩展加载路径；Firefox 不支持此测试入口');
+    for (const check of await verifyExtensionAuth()) record(check.name, check.ok, check.evidence);
+    writeReport();
+    return;
+  }
   generateFixtures();
   const server = await startServer();
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -767,13 +871,7 @@ async function main() {
     server.close();
   }
 
-  const passed = results.filter(item => item.status === 'passed').length;
-  const failed = results.length - passed;
-  const report = { passed, failed, succeeded: failed === 0 && passed > 0, browser: browserName, startedAt: new Date().toISOString(), results, errors, origin };
-  fs.writeFileSync(resultPath, JSON.stringify(report, null, 2));
-  fs.writeFileSync(path.join(archive, `result-${browserName}.json`), JSON.stringify(report, null, 2));
-  console.log(`\n${passed} checks passed, ${failed} failed → ${resultPath}`);
-  if (!report.succeeded) process.exitCode = 1;
+  writeReport(errors, origin);
 }
 
 main().catch(error => {

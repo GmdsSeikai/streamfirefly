@@ -46,6 +46,42 @@ beforeEach(() => {
 });
 
 describe("HLS parser selection preview entry", () => {
+  it("separates preview and download track caches and forwards the preview policy", async () => {
+    send.mockImplementation(async (message: any) => message.type === "task.prepare"
+      ? { ok: true, payload: { fileName: "默认文件名" } }
+      : { ok: true, text: message.url.includes("audio") ? audioText : videoText, url: message.url });
+    const wrapper = mount(HlsParserView, { props: props() });
+    try {
+      await flushPromises();
+      const load = wrapper.findComponent({ name: "HlsSelectionPreview" }).props("loadTrack");
+      const track = { id: "audio", uri: "https://media.example/audio.m3u8" };
+      await load(track, { restrictOrigin: true });
+      await load(track, { restrictOrigin: true });
+      await load(track);
+      await load(track);
+      await load({ ...track, uri: "https://media.example/other-audio.m3u8" }, { restrictOrigin: true });
+      const requests = send.mock.calls.map(call => call[0]).filter(message => message.type === "media.fetchText" && message.url.includes("audio"));
+      expect(requests).toHaveLength(3);
+      expect(requests[0].restrictOrigin).toBe(true);
+      expect(requests[1].restrictOrigin).not.toBe(true);
+      expect(requests[2]).toMatchObject({ restrictOrigin: true, url: "https://media.example/other-audio.m3u8" });
+    } finally { wrapper.unmount(); }
+  });
+  it("explains a rejected cross-origin preview without blocking the download loader", async () => {
+    send.mockImplementation(async (message: any) => message.type === "task.prepare"
+      ? { ok: true, payload: { fileName: "默认文件名" } }
+      : message.restrictOrigin ? { ok: false, error: "media_fetch_failed", status: 403 }
+      : { ok: true, text: message.url.includes("audio") ? audioText : videoText, url: message.url });
+    const wrapper = mount(HlsParserView, { props: props() });
+    try {
+      await flushPromises();
+      const load = wrapper.findComponent({ name: "HlsSelectionPreview" }).props("loadTrack");
+      const track = { id: "external", uri: "https://cdn.example/audio.m3u8" };
+      await expect(load(track, { restrictOrigin: true })).rejects.toThrow("预览不会转发来源凭据");
+      expect((await load(track)).segments).toHaveLength(2);
+      await expect(load(track, { restrictOrigin: true })).rejects.toThrow("预览不会转发来源凭据");
+    } finally { wrapper.unmount(); }
+  });
   it("starts the preview from the entry and invalidates it on media-affecting edits only", async () => {
     const wrapper = mount(HlsParserView, { props: props() });
     await flushPromises();
