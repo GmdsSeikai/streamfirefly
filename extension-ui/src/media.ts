@@ -213,6 +213,9 @@ export function segmentRangeForTime(manifest: HlsManifest, start: number, end: n
   const safeStart = Math.max(0, Math.min(start, manifest.duration));
   const safeEnd = Math.max(safeStart, Math.min(end, manifest.duration));
   const first = manifest.segments.findIndex(segment => segment.end > safeStart);
+  // A start at or past the end of the playlist selects the final segment,
+  // not (through findIndex's -1) the entire video.
+  const from = first < 0 ? manifest.segments.length - 1 : first;
   const last = manifest.segments.findLastIndex(segment => segment.start < safeEnd || safeEnd === safeStart && segment.start <= safeEnd);
   return [Math.max(0, first), Math.max(Math.max(0, first), last < 0 ? lastIndex : last)];
 }

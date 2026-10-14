@@ -88,7 +88,8 @@ fn pump(store: &TaskRuntime, writer: &Writer) {
         let Some(task) = task else {
             continue;
         };
-        if task.resume_requirement.is_some()
+        // Stopping a live recording saves local media without resuming network access.
+        if (task.resume_requirement.is_some() && !(task.live_recording && task.state == "stopping"))
             || !matches!(
                 task.state.as_str(),
                 "queued" | "retrying" | "stopping" | "interrupted"

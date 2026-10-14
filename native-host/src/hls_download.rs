@@ -239,6 +239,51 @@ pub(crate) fn checkpoint_counts(checkpoint: &HlsCheckpoint) -> (u32, u32, u32, u
     (completed, total, failed, retries, bytes)
 }
 
+/// Selects local media for credential-free saving without changing recovery data.
+fn completed_hls_checkpoint(mut checkpoint: HlsCheckpoint, work_dir: &Path) -> HlsCheckpoint {
+    for track in &mut checkpoint.tracks {
+        let track_dir = work_dir.join(&track.id);
+        let mut skipped = false;
+        track.segments.retain_mut(|segment| {
+            let map_completed = segment.map_id.as_ref().is_none_or(|map_id| {
+                track.maps.iter().any(|map| {
+                    &map.id == map_id
+                        && map.state == "succeeded"
+                        && track_dir.join(&map.local_name).is_file()
+                })
+            });
+            if segment.state != "succeeded"
+                || !track_dir.join(&segment.local_name).is_file()
+                || !map_completed
+            {
+                skipped = true;
+                return false;
+            }
+            // A gap must not be presented to FFmpeg as continuous media.
+            segment.discontinuity |= skipped;
+            skipped = false;
+            true
+        });
+        track.maps.retain(|map| {
+            track
+                .segments
+                .iter()
+                .any(|segment| segment.map_id.as_ref() == Some(&map.id))
+        });
+        track.duration = track.segments.iter().map(|segment| segment.duration).sum();
+    }
+    checkpoint
+        .tracks
+        .retain(|track| track.kind != "audio" || !track.segments.is_empty());
+    checkpoint.plan.duration = checkpoint
+        .tracks
+        .iter()
+        .find(|track| track.kind == "video")
+        .map(|track| track.duration)
+        .unwrap_or(0.0);
+    checkpoint
+}
+
 pub(crate) fn checkpoint_jobs(
     checkpoint: &mut HlsCheckpoint,
     work_dir: &Path,
@@ -494,6 +539,19 @@ pub(crate) fn merge_hls_checkpoint(
         {
             continue;
         }
+        if subtitle.segments.is_empty() {
+            subtitle_failures += 1;
+            update(store, writer, &task.id, |current| {
+                set_output_state(
+                    current,
+                    "subtitle",
+                    subtitle_index,
+                    "failed",
+                    Some("hls_no_completed_segments".into()),
+                )
+            });
+            continue;
+        }
         update(store, writer, &task.id, |current| {
             set_output_state(current, "subtitle", subtitle_index, "running", None)
         });
@@ -640,12 +698,43 @@ fn hls_checkpoint_round(
     let runtime_plan =
         runtime_plan.unwrap_or_else(|| runtime_plan_from_persisted(&checkpoint.plan));
     let key_override = runtime_plan.key_override.clone();
-    if task.requires_authorization
+    let stopping = stop_requested(&store, &task.id);
+    let authorization_required = task.requires_authorization
         && task
             .request_headers
             .keys()
-            .all(|name| !is_sensitive_request_header(name))
-    {
+            .all(|name| !is_sensitive_request_header(name));
+    let key_required = task.requires_key_override && key_override.is_none();
+    if (authorization_required || key_required) && stopping {
+        let checkpoint = completed_hls_checkpoint(checkpoint, &work_dir);
+        if !checkpoint
+            .tracks
+            .iter()
+            .any(|track| track.kind == "video" && !track.segments.is_empty())
+        {
+            update(&store, &writer, &task.id, |current| {
+                current.state = "failed".into();
+                current.phase = "failed".into();
+                current.active_connections = 0;
+                current.speed_bytes_per_second = 0;
+                current.eta_seconds = None;
+                current.error = Some("hls_no_completed_segments".into());
+                current.checkpoint_state = Some("recoverable".into());
+                set_output_state(
+                    current,
+                    "media",
+                    0,
+                    "failed",
+                    Some("hls_no_completed_segments".into()),
+                );
+                current.message = Some("没有可合并的完整切片，无法保存录制；可补充授权或密钥后继续下载".into());
+            });
+            clear_stop(&store, &task.id);
+            return None;
+        }
+        return finalize_hls_round(&store, &writer, &task, &output, checkpoint, &work_dir);
+    }
+    if authorization_required {
         update(&store, &writer, &task.id, |current| {
             current.state = "interrupted".into();
             current.phase = "authorization_required".into();
@@ -654,7 +743,7 @@ fn hls_checkpoint_round(
         });
         return None;
     }
-    if task.requires_key_override && key_override.is_none() {
+    if key_required {
         update(&store, &writer, &task.id, |current| {
             current.state = "interrupted".into();
             current.phase = "key_required".into();
@@ -664,8 +753,14 @@ fn hls_checkpoint_round(
         return None;
     }
     let mut checkpoint = checkpoint;
-    if task.live_recording && !stop_requested(&store, &task.id) {
+    if task.live_recording && !stopping {
         if let Err(error) = refresh_live_checkpoint(&store, &task, &mut checkpoint, &work_dir) {
+            // A cancellation that lands while the live manifest is being refreshed must be
+            // honored instead of being mistaken for a refresh failure.
+            if error == "cancelled" {
+                mark_stopped(&store, &writer, &task.id);
+                return None;
+            }
             let authorization = authorization_error(&error);
             update(&store, &writer, &task.id, |current| {
                 current.state = if authorization {
@@ -995,6 +1090,12 @@ fn hls_checkpoint_round(
                     result
                 };
                 if let Err(error) = refreshed {
+                    // Honor a cancellation that lands during a refresh rather than
+                    // surfacing it as a recovery error.
+                    if error == "cancelled" {
+                        mark_stopped(&store, &writer, &task.id);
+                        return None;
+                    }
                     let authorization = authorization_error(&error);
                     update(&store, &writer, &task.id, |current| {
                         current.state = if authorization {
@@ -1039,11 +1140,25 @@ fn hls_checkpoint_round(
         }
     }
     let checkpoint_value = checkpoint.lock().unwrap().clone();
-    let final_video = checkpoint_value
+    finalize_hls_round(&store, &writer, &task, &output, checkpoint_value, &work_dir)
+}
+
+/// Runs the final merge for a checkpoint whose downloads are done (or stopped early)
+/// and settles the task state; never schedules another round. Shared by both the
+/// normal end-of-recording path and the stop-while-authorization-or-key-required path.
+fn finalize_hls_round(
+    store: &TaskRuntime,
+    writer: &Writer,
+    task: &Task,
+    output: &str,
+    checkpoint: HlsCheckpoint,
+    work_dir: &Path,
+) -> Option<(Task, Option<HlsPlan>)> {
+    let final_video = checkpoint
         .tracks
         .iter()
         .find(|track| track.kind == "video");
-    update(&store, &writer, &task.id, |current| {
+    update(store, writer, &task.id, |current| {
         current.phase = "merging".into();
         current.active_connections = 0;
         current.progress = 90;
@@ -1055,24 +1170,16 @@ fn hls_checkpoint_round(
         }
         current.message = Some("切片下载完成，正在合并".into());
     });
-    let publication = match HlsPublication::begin(&store, Some(&writer), &task.id) {
+    let publication = match HlsPublication::begin(store, Some(writer), &task.id) {
         Ok(publication) => publication,
         Err(_) => return None,
     };
-    match merge_hls_checkpoint(
-        &store,
-        &writer,
-        &task,
-        &output,
-        &checkpoint_value,
-        &work_dir,
-        &publication,
-    ) {
+    match merge_hls_checkpoint(store, writer, task, output, &checkpoint, work_dir, &publication) {
         Ok(0) => {
-            let _ = publication.finish(&work_dir);
-            clear_stop(&store, &task.id);
+            let _ = publication.finish(work_dir);
+            clear_stop(store, &task.id);
         }
-        Ok(subtitle_failures) => update(&store, &writer, &task.id, |current| {
+        Ok(subtitle_failures) => update(store, writer, &task.id, |current| {
             let conflict = current.outputs.iter().any(|output| {
                 output.kind == "subtitle" && output.error.as_deref() == Some("output_path_conflict")
             });
@@ -1096,8 +1203,8 @@ fn hls_checkpoint_round(
                 format!("视频已完成，{subtitle_failures} 条字幕生成失败，可重试")
             });
         }),
-        Err(error) if error == "cancelled" => mark_stopped(&store, &writer, &task.id),
-        Err(error) => update(&store, &writer, &task.id, |current| {
+        Err(error) if error == "cancelled" => mark_stopped(store, writer, &task.id),
+        Err(error) => update(store, writer, &task.id, |current| {
             current.state = "failed".into();
             current.phase = "failed".into();
             current.error = Some(error.clone());
@@ -1204,4 +1311,116 @@ pub(crate) fn refresh_live_checkpoint(
         .map(|track| track.duration)
         .unwrap_or(0.0);
     Ok(added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hls::{parse_media_playlist, PersistedPlan, CHECKPOINT_VERSION};
+
+    fn completed_fixture() -> (PathBuf, HlsCheckpoint) {
+        let root = std::env::temp_dir().join(format!("streamfirefly-stop-save-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("video")).unwrap();
+        let manifest = PersistedManifest {
+            base_url: "https://example.test/live.m3u8".into(),
+            text: "#EXTM3U\n#EXT-X-MAP:URI=init-a.mp4\n#EXTINF:1,\n0.m4s\n#EXTINF:2,\n1.m4s\n#EXT-X-MAP:URI=init-b.mp4\n#EXTINF:3,\n2.m4s\n#EXTINF:4,\n3.m4s\n#EXT-X-MAP:URI=init-c.mp4\n#EXTINF:5,\n4.m4s\n#EXT-X-ENDLIST\n".into(),
+        };
+        let mut track = parse_media_playlist("video", "video", None, None, &manifest).unwrap();
+        for segment in &mut track.segments {
+            segment.state = "succeeded".into();
+            let destination = root.join("video").join(&segment.local_name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, b"media").unwrap();
+        }
+        for map in &mut track.maps {
+            map.state = "succeeded".into();
+            let destination = root.join("video").join(&map.local_name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, b"init").unwrap();
+        }
+        let checkpoint = HlsCheckpoint {
+            version: CHECKPOINT_VERSION,
+            task_id: "stop-save".into(),
+            plan: PersistedPlan {
+                version: 3,
+                duration: 15.0,
+                container: "mkv".into(),
+                video_manifest: manifest,
+                audio_manifest: None,
+                subtitles: Vec::new(),
+                live: true,
+                poll_interval_seconds: Some(1),
+            },
+            tracks: vec![track],
+        };
+        (root, checkpoint)
+    }
+
+    #[test]
+    fn stopped_save_preserves_a_fully_completed_recording() {
+        let (root, checkpoint) = completed_fixture();
+        let expected = serde_json::to_value(&checkpoint).unwrap();
+        let selected = completed_hls_checkpoint(checkpoint, &root);
+        assert_eq!(serde_json::to_value(&selected).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stopped_save_keeps_completed_media_and_maps_and_marks_gaps() {
+        let (root, mut checkpoint) = completed_fixture();
+        let track = &mut checkpoint.tracks[0];
+        track.segments[1].state = "failed".into();
+        fs::remove_file(root.join("video").join(&track.segments[3].local_name)).unwrap();
+        track.maps[2].state = "pending".into();
+        let original = serde_json::to_value(&checkpoint).unwrap();
+        let selected = completed_hls_checkpoint(checkpoint.clone(), &root);
+        let video = &selected.tracks[0];
+        assert_eq!(video.segments.iter().map(|segment| segment.index).collect::<Vec<_>>(), vec![0, 2]);
+        assert!(!video.segments[0].discontinuity);
+        assert!(video.segments[1].discontinuity);
+        assert_eq!(video.maps.len(), 2);
+        assert_eq!(video.duration, 4.0);
+        assert_eq!(selected.plan.duration, 4.0);
+        assert_eq!(serde_json::to_value(&checkpoint).unwrap(), original);
+        let playlist = fs::read_to_string(local_playlist(video, &root.join("video")).unwrap()).unwrap();
+        assert!(playlist.contains("#EXT-X-DISCONTINUITY"));
+        for segment in &checkpoint.tracks[0].segments {
+            assert_eq!(playlist.contains(&segment.local_name), matches!(segment.index, 0 | 2));
+        }
+        assert!(!playlist.contains(&checkpoint.tracks[0].maps[2].local_name));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stopped_save_excludes_media_with_missing_initialization_files() {
+        let (root, checkpoint) = completed_fixture();
+        fs::remove_file(root.join("video").join(&checkpoint.tracks[0].maps[0].local_name)).unwrap();
+        let selected = completed_hls_checkpoint(checkpoint, &root);
+        assert_eq!(selected.tracks[0].segments.iter().map(|segment| segment.index).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert!(selected.tracks[0].segments[0].discontinuity);
+        assert_eq!(selected.tracks[0].maps.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stopped_save_ignores_partial_files_and_keeps_subtitle_output_indices() {
+        let (root, mut checkpoint) = completed_fixture();
+        for segment in &mut checkpoint.tracks[0].segments {
+            segment.state = "pending".into();
+        }
+        let mut audio = checkpoint.tracks[0].clone();
+        audio.id = "audio".into();
+        audio.kind = "audio".into();
+        let mut subtitle = audio.clone();
+        subtitle.id = "subtitle-0".into();
+        subtitle.kind = "subtitle".into();
+        checkpoint.tracks.extend([audio, subtitle]);
+        let selected = completed_hls_checkpoint(checkpoint, &root);
+        assert!(selected.tracks[0].segments.is_empty());
+        assert!(selected.tracks[0].maps.is_empty());
+        assert_eq!(selected.plan.duration, 0.0);
+        assert_eq!(selected.tracks.len(), 2);
+        assert_eq!(selected.tracks[1].id, "subtitle-0");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -33,7 +33,7 @@ HLS 解析页只能在创建下载任务后才能确认所选画质、音轨和�
 
 ## Verification
 
-- `npm run typecheck`、`npm run validate:extension` 通过；全量 `npx vitest run` 270 项通过（目标 6 文件 77 项，含 R1–R8 转正回归与 R2-1/R2-2 新回归）。
+- `npm run typecheck`、`npm run validate:extension` 通过；合入最新 main 后，`npm run test:unit` 中的全量 UI 276 项通过，保留上游字幕选择、文件命名和范围边界回归，包含预览生命周期、长片段拖动及外置音轨回归。
 - `node tools/test-extension-logic.mjs`（并入 `npm run test:unit`）：取消归属/竞争/回收、跨会话规则不丢更新、安装中清理拦截、导航 abort 通过。
 - `npm run test:hls:preview`（headless Playwright + 构建后生产组件 + ffmpeg 真实媒体）：Chromium **35 项执行通过、0 失败、0 跳过**（完整覆盖）；Firefox 156 **34 项执行通过、0 失败、1 跳过**（跳过项为 Chromium 专属的真实扩展鉴权，不计通过，覆盖率不完整）——即 Firefox 媒体矩阵全部执行通过。内容：真实 TS/fMP4 解码、双音轨频谱、终点停止、暂停/拖动/重播、AES 全矩阵（隐式/显式/无前缀手动 IV、轮换、METHOD=NONE、15/17 字节）、ByteRange 中间隐式片真实 Range/206、fMP4 MAP ByteRange、discontinuity、请求白名单、收起/关闭在途请求中止（ERR_ABORTED/NS_BINDING_ABORTED）、**长片段终点后拖回回收缓冲区重取片续播**、**无 AUDIO 分组仍播放所选外置音轨**、失败隔离、无 pageerror。
 - **真实扩展鉴权（Chromium 无头、真实 DNR/网络栈）**：chromium channel + `--load-extension` 载入构建扩展（隔离 profile），双 origin 实测——同源两路请求携带候选 Authorization 与 DNR 注入 Referer；跨域与跨源重定向零凭据；DNR 规则 apply=1/clear=0/关 tab=0。
