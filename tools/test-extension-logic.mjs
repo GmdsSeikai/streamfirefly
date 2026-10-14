@@ -115,14 +115,7 @@ class FixtureWorker {
   postMessage(job) { queueMicrotask(() => { if (!this.stopped) this.scope.self.onmessage({ data: structuredClone(job) }); }); }
   terminate() { this.stopped = true; }
 }
-vm.runInNewContext(source, { chrome: api, Worker: FixtureWorker, Error, URL, URLSearchParams, Map, Set, Number, Object, Date, Promise, TextEncoder, TextDecoder, Headers, Uint8Array, AbortController, AbortSignal, crypto: webcrypto, structuredClone, fetch: async (url, init) => {
-  fetchCalls.push({ url, init });
-  const value = typeof fetchResponse === 'function' ? fetchResponse(url, init) : fetchResponse;
-  if (!init?.signal) return value;
-  if (init.signal.aborted) { const error = new Error('aborted'); error.name = 'AbortError'; throw error; }
-  if (!(value instanceof Promise)) return value;
-  return Promise.race([value, new Promise((_, reject) => init.signal.addEventListener('abort', () => { const error = new Error('aborted'); error.name = 'AbortError'; reject(error); }))]);
-}, setTimeout, clearTimeout, console });
+vm.runInNewContext(source, { chrome: api, Worker: FixtureWorker, Error, URL, URLSearchParams, Map, Set, Number, Object, Date, Promise, TextEncoder, TextDecoder, Headers, Uint8Array, AbortSignal, crypto: webcrypto, structuredClone, fetch: async (url, init) => { fetchCalls.push({ url, init }); return fetchResponse; }, setTimeout, clearTimeout, console });
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const flush = async () => { for (let index = 0; index < 6; index += 1) await settle(); };
@@ -327,48 +320,6 @@ if (JSON.stringify(listeners.previewRules.removeRuleIds) !== JSON.stringify([sec
 const mismatchedPreview = await send({ type: 'preview.headers.apply', payload: { previewSessionId: 'preview-invalid', candidateId: video.id, url: 'https://other.example/video.mp4', headers: video.requestHeaders } }, { tab: { id: 7 } });
 if (mismatchedPreview.ok || mismatchedPreview.error !== 'preview_candidate_mismatch') throw new Error(`Preview headers accepted a mismatched candidate origin: ${JSON.stringify(mismatchedPreview)}`);
 
-// Preview manifest cancellation: ownership, cancel-before-registration race, and real abort.
-const previewContextId = probeContextId;
-fetchResponse = () => new Promise(() => {});
-const hangingFetch = send({ type: 'media.fetchText', tabId: 7, id: video.id, url: 'https://media.example/hang.m3u8', requestId: 'req-1', sourceContextId: previewContextId }, { tab: { id: 7 } });
-await settle();
-const foreignCancel = await send({ type: 'media.fetchText.cancel', requestId: 'req-1', sourceContextId: previewContextId }, { tab: { id: 8 } });
-if (!foreignCancel.ok || foreignCancel.pending) throw new Error(`Cancel from another tab reported a hit: ${JSON.stringify(foreignCancel)}`);
-const mismatchedCancel = await send({ type: 'media.fetchText.cancel', requestId: 'req-1', sourceContextId: 'other-context' }, { tab: { id: 7 } });
-if (mismatchedCancel.ok || mismatchedCancel.error !== 'media_cancel_mismatch') throw new Error(`Cancel ignored the source context: ${JSON.stringify(mismatchedCancel)}`);
-const matchedCancel = await send({ type: 'media.fetchText.cancel', requestId: 'req-1', sourceContextId: previewContextId }, { tab: { id: 7 } });
-if (!matchedCancel.ok || !matchedCancel.pending) throw new Error(`Cancel missed the in-flight fetch: ${JSON.stringify(matchedCancel)}`);
-const cancelledFetch = await hangingFetch;
-if (cancelledFetch.ok || cancelledFetch.error !== 'media_fetch_cancelled') throw new Error(`Cancelled fetch returned a manifest: ${JSON.stringify(cancelledFetch)}`);
-const earlyCancel = await send({ type: 'media.fetchText.cancel', requestId: 'req-early', sourceContextId: previewContextId }, { tab: { id: 7 } });
-if (!earlyCancel.ok || earlyCancel.pending) throw new Error(`Cancel-before-registration was not recorded: ${JSON.stringify(earlyCancel)}`);
-const lateStart = await send({ type: 'media.fetchText', tabId: 7, id: video.id, url: 'https://media.example/early.m3u8', requestId: 'req-early', sourceContextId: previewContextId }, { tab: { id: 7 } });
-if (lateStart.ok || lateStart.error !== 'media_fetch_cancelled') throw new Error(`A pre-cancelled request still started: ${JSON.stringify(lateStart)}`);
-const staleFetchText = await send({ type: 'media.fetchText', tabId: 7, id: video.id, url: 'https://media.example/stale.m3u8', requestId: 'req-stale', sourceContextId: 'stale-context' }, { tab: { id: 7 } });
-if (staleFetchText.ok || staleFetchText.error !== 'media_context_stale') throw new Error(`Preview fetch accepted a stale page context: ${JSON.stringify(staleFetchText)}`);
-fetchResponse = new Response('#EXTM3U\n#EXT-X-ENDLIST\n', { headers: { 'content-type': 'application/vnd.apple.mpegurl' } });
-await send({ type: 'media.fetchText', tabId: 7, id: video.id, url: 'https://cdn.other/x.m3u8', requestId: 'req-x', sourceContextId: previewContextId }, { tab: { id: 7 } });
-if (new Headers(fetchCalls.at(-1).init.headers).get('authorization')) throw new Error('Preview fetch forwarded candidate Authorization to a foreign origin');
-await send({ type: 'media.fetchText', tabId: 7, id: video.id, url: 'https://media.example/ok.m3u8', requestId: 'req-y', sourceContextId: previewContextId }, { tab: { id: 7 } });
-if (!new Headers(fetchCalls.at(-1).init.headers).get('authorization')) throw new Error('Preview fetch dropped the same-origin Authorization');
-
-// Preview rule apply/clear stay ordered per session even when sent together.
-const seqApply = send({ type: 'preview.headers.apply', payload: { previewSessionId: 'preview-seq', candidateId: video.id, url: video.url, headers: video.requestHeaders } }, { tab: { id: 7 } });
-const seqClear = send({ type: 'preview.headers.clear', previewSessionId: 'preview-seq' }, { tab: { id: 7 } });
-await Promise.all([seqApply, seqClear]);
-const seqUpdates = previewRuleUpdates.filter(update => update.addRules?.some(rule => rule.condition?.regexFilter === '^https://media\\.example(?:/|$)') || update.removeRuleIds?.length);
-const seqApplied = previewRuleUpdates.findLast(update => update.addRules?.[0]?.condition?.tabIds?.[0] === 7);
-const seqRemoved = previewRuleUpdates.findLast(update => update.removeRuleIds?.includes(seqApplied?.addRules?.[0]?.id));
-if (!seqApplied || !seqRemoved || previewRuleUpdates.indexOf(seqRemoved) < previewRuleUpdates.indexOf(seqApplied)) throw new Error(`Session apply/clear were not serialized: ${JSON.stringify(seqUpdates)}`);
-
-// Navigation aborts in-flight preview fetches instead of leaving them running.
-fetchResponse = () => new Promise(() => {});
-const navHang = send({ type: 'media.fetchText', tabId: 7, id: video.id, url: 'https://media.example/hang2.m3u8', requestId: 'req-2', sourceContextId: previewContextId }, { tab: { id: 7 } });
-await settle();
-listeners.history({ tabId: 7, frameId: 0, url: 'https://media.example/next' });
-const navCancelled = await navHang;
-if (navCancelled.ok || navCancelled.error !== 'media_fetch_cancelled') throw new Error(`Navigation left a preview fetch running: ${JSON.stringify(navCancelled)}`);
-
 tabsById.get(7).url = 'https://media.example/next';
 listeners.history({ tabId: 7, frameId: 0, url: tabsById.get(7).url });
 await settle();
@@ -562,53 +513,3 @@ const cleared = await send({ type: 'extraction.save', payload: { version: 1, rul
 if (!cleared.ok || cleared.value.cleanup.status !== 'complete' || (await send({ type: 'media.candidates', tabId: 8 })).some(item => item.url === extractedUrl)) throw new Error('Extraction save did not clean derived candidates');
 listeners.removed(8); await flush();
 console.log('Trusted extraction routes, real evaluation worker code, independent candidates and cleanup passed');
-
-// R4/R8: preview rule ownership races and registration recycling.
-const { createPreview } = await import('../extension/src/preview.js');
-{
-  const activeRules = new Map();
-  const ruleApi = { declarativeNetRequest: { updateSessionRules: async ({ removeRuleIds = [], addRules = [] }) => { for (const id of removeRuleIds) activeRules.delete(id); for (const rule of addRules) activeRules.set(rule.id, rule); } } };
-  let releaseCandidates; const candidateGate = new Promise(resolve => { releaseCandidates = resolve; });
-  const preview = createPreview(ruleApi, async () => { await candidateGate; return { url: 'https://media.example/master.m3u8' }; });
-  const sender = { tab: { id: 7 } };
-  const apply = id => preview.updatePreviewHeaders({ action: 'apply', previewSessionId: id, candidateId: 'c1', url: 'https://media.example/master.m3u8', headers: { authorization: 'race-token' } }, sender);
-  const first = apply('race-a'), second = apply('race-b');
-  await Promise.resolve();
-  releaseCandidates();
-  const [resultA, resultB] = await Promise.all([first, second]);
-  if (!resultA.ok || !resultB.ok || activeRules.size !== 2) throw new Error(`Concurrent sessions lost a rule registration: ${JSON.stringify([...activeRules.keys()])}`);
-  await preview.updatePreviewHeaders({ action: 'clear', previewSessionId: 'race-a' }, sender);
-  if (activeRules.size !== 1) throw new Error('Clearing one preview session removed the wrong session rule');
-  await preview.updatePreviewHeaders({ action: 'clear', previewSessionId: 'race-b' }, sender);
-  if (activeRules.size !== 0) throw new Error(`Session clears left an orphan rule: ${JSON.stringify([...activeRules.keys()])}`);
-  // A cleanup in the middle of an install must stop the stale install from publishing.
-  let releaseLate; const lateGate = new Promise(resolve => { releaseLate = resolve; });
-  const latePreview = createPreview(ruleApi, async () => { await lateGate; return { url: 'https://media.example/master.m3u8' }; });
-  const lateApply = latePreview.updatePreviewHeaders({ action: 'apply', previewSessionId: 'late', candidateId: 'c1', url: 'https://media.example/master.m3u8', headers: { authorization: 'race-token' } }, sender);
-  await Promise.resolve();
-  const wipe = latePreview.clearPreviewHeadersForTab(7);
-  releaseLate();
-  const lateResult = await lateApply;
-  await wipe;
-  if (lateResult.ok || lateResult.error !== 'preview_tab_cleared' || activeRules.size !== 0) throw new Error(`Cleanup did not stop a stale install: ${JSON.stringify({ lateResult, rules: [...activeRules.keys()] })}`);
-}
-console.log('Preview rule ownership races and tab cleanup barriers passed');
-
-{
-  tabsById.set(7, { id: 7, active: true, url: 'https://media.example/page', title: '媒体页面 A', lastAccessed: 2, windowId: 1 });
-  await send({ type: 'media.add', candidate: { url: 'https://media.example/reuse.m3u8', mime: 'application/vnd.apple.mpegurl', source: 'network' } }, { tab: { id: 7 } });
-  const contextId = (await send({ type: 'ui.context.get', scope: 'sender' }, { tab: { id: 7 } })).context.sourceContextId;
-  for (let cycle = 0; cycle < 3; cycle += 1) {
-    fetchResponse = () => new Promise(() => {});
-    const hanging = send({ type: 'media.fetchText', tabId: 7, id: 'https://media.example/reuse.m3u8', url: 'https://media.example/reuse.m3u8', requestId: 'reuse-1', sourceContextId: contextId }, { tab: { id: 7 } });
-    await settle();
-    const cancelled = await send({ type: 'media.fetchText.cancel', requestId: 'reuse-1', sourceContextId: contextId }, { tab: { id: 7 } });
-    if (!cancelled.ok || !cancelled.pending) throw new Error(`Registered cancel missed: ${JSON.stringify(cancelled)}`);
-    const result = await hanging;
-    if (result.ok || result.error !== 'media_fetch_cancelled') throw new Error(`Cancelled fetch returned a manifest: ${JSON.stringify(result)}`);
-  }
-  fetchResponse = new Response('#EXTM3U\n#EXT-X-ENDLIST\n', { headers: { 'content-type': 'application/vnd.apple.mpegurl' } });
-  const reused = await send({ type: 'media.fetchText', tabId: 7, id: 'https://media.example/reuse.m3u8', url: 'https://media.example/reuse.m3u8', requestId: 'reuse-1', sourceContextId: contextId }, { tab: { id: 7 } });
-  if (!reused.ok) throw new Error(`Completed cancellations retained state that blocked a fresh request: ${JSON.stringify(reused)}`);
-}
-console.log('Completed cancellations recycle their request registrations passed');

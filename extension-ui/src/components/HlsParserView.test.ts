@@ -5,7 +5,10 @@ import HlsParserView from "./HlsParserView.vue";
 const { send, create } = vi.hoisted(() => ({ send: vi.fn(), create: vi.fn() }));
 vi.mock("../api", () => ({ sendMessage: send, extensionApi: () => ({ runtime: { sendMessage: true } }) }));
 vi.mock("../download-client", () => ({ createDownload: create }));
-vi.mock("./HlsSelectionPreview.vue", () => ({ default: { name: "HlsSelectionPreview", props: ["snapshot"], render: () => null } }));
+vi.mock("./HlsSelectionPreview.vue", async () => {
+  const { h } = await import("vue");
+  return { default: { name: "HlsSelectionPreview", props: ["snapshot", "loadTrack", "poster", "canStart"], emits: ["start"], setup(props: any, { emit }: any) { return () => h("button", { type: "button", disabled: props.canStart === false, onClick: () => emit("start") }, "播放所选范围"); } } };
+});
 
 const masterText = `#EXTM3U
 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="中文",LANGUAGE="zh-CN",DEFAULT=YES,URI="audio.m3u8"
@@ -62,7 +65,51 @@ describe("HLS parser selection preview entry", () => {
 
     await wrapper.findAll(".range-tabs button").find(button => button.text() === "按切片")!.trigger("click");
     await flushPromises();
-    expect(wrapper.findComponent({ name: "HlsSelectionPreview" }).exists()).toBe(false);
+    expect(wrapper.findComponent({ name: "HlsSelectionPreview" }).props("snapshot")).toBeNull();
+    wrapper.unmount();
+  });
+
+  it("offers the preview without a local helper and hands it the cached track loader", async () => {
+    const wrapper = mount(HlsParserView, { props: { ...props(), capabilities: [], connected: false } });
+    await flushPromises();
+    const entry = wrapper.findAll("button").find(button => button.text() === "播放所选范围")!;
+    expect(entry.attributes("disabled")).toBeUndefined();
+    await entry.trigger("click");
+    await flushPromises();
+    const preview = wrapper.findComponent({ name: "HlsSelectionPreview" });
+    expect(typeof preview.props("loadTrack")).toBe("function");
+    wrapper.unmount();
+  });
+
+  it("keeps the player in the range card before any click, without a snapshot", async () => {
+    const wrapper = mount(HlsParserView, { props: { ...props(), candidate: { ...props().candidate, poster: "https://media.example/poster.jpg" } } });
+    await flushPromises();
+    const preview = wrapper.get(".parser-range").findComponent({ name: "HlsSelectionPreview" });
+    expect(preview.exists()).toBe(true);
+    expect(preview.props("snapshot")).toBeNull();
+    expect(preview.props("canStart")).toBe(true);
+    expect(preview.props("poster")).toBe("https://media.example/poster.jpg");
+    wrapper.unmount();
+  });
+
+  it("marks typed times inside their segments and labels the timeline scale", async () => {
+    const wrapper = mount(HlsParserView, { props: props() });
+    await flushPromises();
+    expect(wrapper.get(".timeline-scale").text()).toBe("00:0000:15");
+    expect(wrapper.findAll(".timeline-marker")).toHaveLength(0);
+    await wrapper.findAll(".range-tabs button").find(button => button.text() === "按时间")!.trigger("click");
+    const [start, end] = wrapper.findAll(".range-inputs input");
+    await start.setValue("3.5");
+    await end.setValue("8.1");
+    await flushPromises();
+    const blocks = wrapper.findAll(".timeline i");
+    const startMarker = blocks[0].find(".timeline-marker");
+    const endMarker = blocks[1].find(".timeline-marker");
+    expect(Number.parseFloat(startMarker.attributes("style")!.match(/left:\s*([\d.]+)%/)![1])).toBeCloseTo(70);
+    expect(Number.parseFloat(endMarker.attributes("style")!.match(/left:\s*([\d.]+)%/)![1])).toBeCloseTo(62);
+    expect(blocks[2].find(".timeline-marker").exists()).toBe(false);
+    await wrapper.findAll(".range-tabs button").find(button => button.text() === "按切片")!.trigger("click");
+    expect(wrapper.findAll(".timeline-marker")).toHaveLength(0);
     wrapper.unmount();
   });
 
@@ -97,7 +144,8 @@ describe("HLS parser selection preview entry", () => {
     expect(wrapper.text()).toContain("有效的时间");
     const entry = wrapper.findAll("button").find(button => button.text() === "播放所选范围")!;
     expect(entry.attributes("disabled")).toBeDefined();
-    expect(wrapper.findComponent({ name: "HlsSelectionPreview" }).exists()).toBe(false);
+    expect(wrapper.findComponent({ name: "HlsSelectionPreview" }).props("canStart")).toBe(false);
+    expect(wrapper.findComponent({ name: "HlsSelectionPreview" }).props("snapshot")).toBeNull();
     wrapper.unmount();
   });
 

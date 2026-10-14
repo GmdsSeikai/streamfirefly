@@ -1,8 +1,8 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import type { HlsSelectionSnapshot } from "../download-plan";
-import { parseHls } from "../media";
+import { parseHls, type HlsTrack } from "../media";
 
-const hlsMock = vi.hoisted(() => ({ instances: [] as any[], hangFetch: false, handleMessage: null as null | ((message: any) => any) }));
+const hlsMock = vi.hoisted(() => ({ instances: [] as any[], hangFetch: false, handleMessage: null as null | ((message: any) => any), trackResponse: null as null | (() => Promise<any>) }));
 
 vi.mock("hls.js", async () => {
   class MockHls {
@@ -51,15 +51,19 @@ const audioText = "#EXTM3U\n#EXT-X-TARGETDURATION:3\n#EXTINF:3,\nhttps://media.e
 vi.stubGlobal("chrome", { runtime: { sendMessage: vi.fn(async (message: any) => {
   sent.push(message);
   if (hlsMock.handleMessage) return hlsMock.handleMessage(message);
-  if (message.type === "media.fetchText") {
-    if (hlsMock.hangFetch) return new Promise(() => {});
-    return { ok: true, text: audioText, url: message.url };
-  }
   return { ok: true };
 }) } });
 vi.stubGlobal("browser", undefined);
 
 const { default: HlsSelectionPreview } = await import("./HlsSelectionPreview.vue");
+
+const trackCalls: string[] = [];
+async function loadTrack(track: HlsTrack) {
+  trackCalls.push(track.uri || "");
+  if (hlsMock.trackResponse) return hlsMock.trackResponse();
+  if (hlsMock.hangFetch) return new Promise<never>(() => {});
+  return parseHls(audioText, track.uri || "");
+}
 
 const videoText = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nhttps://media.example/v1.ts\n#EXTINF:2,\nhttps://media.example/v2.ts\n#EXT-X-ENDLIST";
 
@@ -83,6 +87,8 @@ function makeSnapshot(overrides: Partial<HlsSelectionSnapshot> = {}): HlsSelecti
 describe("HLS selection preview player", () => {
   beforeEach(() => {
     sent.length = 0;
+    trackCalls.length = 0;
+    hlsMock.trackResponse = null;
     hlsMock.instances.length = 0;
     hlsMock.hangFetch = false;
     hlsMock.handleMessage = null;
@@ -93,7 +99,7 @@ describe("HLS selection preview player", () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
   it("prepares and plays a selected range, then stops at the main-stream end", async () => {
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot() } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot() } });
     await flushPromises();
     const media = wrapper.find("video").element as HTMLVideoElement;
     expect(hlsMock.instances).toHaveLength(1);
@@ -111,18 +117,18 @@ describe("HLS selection preview player", () => {
   });
 
   it("keeps media paused when the browser rejects play()", async () => {
-    vi.spyOn(HTMLMediaElement.prototype, "play").mockRejectedValue(new Error("NotAllowedError"));
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot() } });
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockRejectedValue(new DOMException("blocked", "NotAllowedError"));
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot() } });
     await flushPromises();
     expect(wrapper.text()).toContain("已暂停");
-    expect(wrapper.text()).toContain("浏览器阻止了自动播放");
+    expect(wrapper.text()).toContain("浏览器阻止了播放");
     wrapper.unmount();
   });
 
   it("fails on prepare timeout without delivering a late preview", async () => {
     vi.useFakeTimers();
     hlsMock.hangFetch = true;
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot() } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot() } });
     await vi.advanceTimersByTimeAsync(15000);
     await flushPromises();
     expect(wrapper.text()).toContain("预览失败");
@@ -133,7 +139,7 @@ describe("HLS selection preview player", () => {
   });
 
   it("fails immediately on key load errors without recovery loops", async () => {
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null, keyOverride: { kind: "hex", value: "00112233445566778899aabbccddeeff", iv: null } }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null, keyOverride: { kind: "hex", value: "00112233445566778899aabbccddeeff", iv: null } }) } });
     await flushPromises();
     const instance = hlsMock.instances[0];
     instance.emit("error", { fatal: true, type: "networkError", details: "keyLoadError" });
@@ -145,7 +151,7 @@ describe("HLS selection preview player", () => {
   });
 
   it("recovers a fatal network error only once", async () => {
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     await flushPromises();
     const instance = hlsMock.instances[0];
     instance.emit("error", { fatal: true, type: "networkError", details: "manifestLoadError" });
@@ -157,14 +163,15 @@ describe("HLS selection preview player", () => {
   });
 
   it("disposes sessions and clears rules when the snapshot is withdrawn or unmounted", async () => {
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     await flushPromises();
     const instance = hlsMock.instances[0];
     await wrapper.setProps({ snapshot: null });
     await flushPromises();
     expect(instance.destroyed).toBe(true);
     expect(sent.some(message => message.type === "preview.headers.clear")).toBe(true);
-    expect(wrapper.text()).toContain("未开始");
+    expect(wrapper.find(".preview-play").text()).toBe("播放所选范围");
+    expect(wrapper.find(".preview-controls").exists()).toBe(false);
 
     await wrapper.setProps({ snapshot: makeSnapshot({ audioTrack: null }) });
     await flushPromises();
@@ -174,20 +181,24 @@ describe("HLS selection preview player", () => {
     expect(hlsMock.instances[1].destroyed).toBe(true);
   });
 
-  it("cancels in-flight manifest fetches when the session is invalidated", async () => {
-    hlsMock.hangFetch = true;
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot() } });
-    await flushPromises();
-    await wrapper.setProps({ snapshot: null });
-    await flushPromises();
-    expect(sent.filter(message => message.type === "media.fetchText.cancel")).toHaveLength(1);
-    hlsMock.hangFetch = false;
-    wrapper.unmount();
+  it("ignores an audio manifest that arrives after the session is withdrawn", async () => {
+    let release!: () => void;
+    hlsMock.trackResponse = () => new Promise(resolve => { release = () => resolve(parseHls(audioText, "https://media.example/audio.m3u8")); });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot() } });
+    try {
+      await flushPromises();
+      await wrapper.setProps({ snapshot: null });
+      await flushPromises();
+      release();
+      await flushPromises();
+      expect(hlsMock.instances).toHaveLength(0);
+      expect(sent.some(message => message.type === "preview.headers.apply")).toBe(false);
+    } finally { wrapper.unmount(); await flushPromises(); }
   });
 
   it("keeps playing while the same snapshot object is held", async () => {
     const snapshot = makeSnapshot({ audioTrack: null });
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot } });
     await flushPromises();
     expect(hlsMock.instances).toHaveLength(1);
     await wrapper.setProps({ snapshot });
@@ -198,14 +209,14 @@ describe("HLS selection preview player", () => {
 
   it("does not resume a timed-out preparation when its audio response arrives late (R1)", async () => {
     vi.useFakeTimers();
-    let release!: (value: any) => void;
-    hlsMock.handleMessage = message => message.type === "media.fetchText" ? new Promise(resolve => { release = resolve; }) : { ok: true };
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot() } });
+    let release!: () => void;
+    hlsMock.trackResponse = () => new Promise(resolve => { release = () => resolve(parseHls(audioText, "https://media.example/audio.m3u8")); });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot() } });
     try {
       await flushPromises();
       await vi.advanceTimersByTimeAsync(15001);
       expect(wrapper.text()).toContain("预览失败");
-      release({ ok: true, text: audioText, url: "https://media.example/audio.m3u8" });
+      release();
       await flushPromises();
       expect(hlsMock.instances).toHaveLength(0);
     } finally { wrapper.unmount(); await flushPromises(); }
@@ -214,7 +225,7 @@ describe("HLS selection preview player", () => {
   it("keeps the deadline until media.play actually resolves (R2)", async () => {
     vi.useFakeTimers();
     vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(() => new Promise(() => {}));
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     try {
       await flushPromises();
       expect(hlsMock.instances).toHaveLength(1);
@@ -226,7 +237,7 @@ describe("HLS selection preview player", () => {
   });
 
   it("pauses and destroys the media session on fatal failure (R1)", async () => {
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     try {
       await flushPromises();
       const instance = hlsMock.instances[0];
@@ -242,7 +253,7 @@ describe("HLS selection preview player", () => {
 
   it("does not start Hls when required header installation fails (R7)", async () => {
     hlsMock.handleMessage = message => message.type === "preview.headers.apply" ? { ok: false, error: "preview_headers_unavailable" } : { ok: true };
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     try {
       await flushPromises();
       expect(hlsMock.instances).toHaveLength(0);
@@ -253,7 +264,7 @@ describe("HLS selection preview player", () => {
 
   it("starts playback without header replay for a public candidate (R7)", async () => {
     hlsMock.handleMessage = message => message.type === "preview.headers.apply" ? { ok: false, error: "preview_headers_unavailable" } : { ok: true };
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null, source: { ...makeSnapshot().source, requestHeaders: {} } }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null, source: { ...makeSnapshot().source, requestHeaders: {} } }) } });
     try {
       await flushPromises();
       expect(hlsMock.instances).toHaveLength(1);
@@ -262,16 +273,16 @@ describe("HLS selection preview player", () => {
   });
 
   it("does not start a manifest request after immediate unmount (R3)", async () => {
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot() } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot() } });
     wrapper.unmount();
     await flushPromises();
-    expect(sent.filter(message => message.type === "media.fetchText")).toHaveLength(0);
+    expect(trackCalls).toHaveLength(0);
   });
 
   it("ignores a late play resolution after snapshot withdrawal (R3)", async () => {
     let release!: () => void;
     vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     try {
       await flushPromises();
       release();
@@ -285,20 +296,21 @@ describe("HLS selection preview player", () => {
       await flushPromises();
       release();
       await flushPromises();
-      expect(wrapper.text()).toContain("未开始");
+      expect(wrapper.find(".preview-play").text()).toBe("播放所选范围");
+      expect(wrapper.find(".preview-controls").exists()).toBe(false);
     } finally { wrapper.unmount(); await flushPromises(); }
   });
 
-  it("bounds header cleanup retries and records the failure fact (R7)", async () => {
+  it("sends a single header cleanup per terminated session", async () => {
     hlsMock.handleMessage = message => {
       if (message.type === "preview.headers.clear") return { ok: false, error: "preview_headers_unavailable" };
       return { ok: true };
     };
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     await flushPromises();
     await wrapper.setProps({ snapshot: null });
     await flushPromises();
-    expect(sent.filter(message => message.type === "preview.headers.clear")).toHaveLength(2);
+    expect(sent.filter(message => message.type === "preview.headers.clear")).toHaveLength(1);
     wrapper.unmount();
     await flushPromises();
   });
@@ -309,7 +321,7 @@ describe("HLS selection preview player", () => {
       if (message.type === "preview.headers.apply") return new Promise(resolve => { releaseApply = resolve; });
       return { ok: true };
     };
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     try {
       await flushPromises();
       await wrapper.setProps({ snapshot: null });
@@ -322,7 +334,7 @@ describe("HLS selection preview player", () => {
   });
 
   it("resumes loading after seeking back from the end (R2-1)", async () => {
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     try {
       await flushPromises();
       const instance = hlsMock.instances[0];
@@ -345,7 +357,7 @@ describe("HLS selection preview player", () => {
   it("does not pause the shared media from a stale run's play resolution (R2-1)", async () => {
     let releaseFirst!: () => void;
     vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementationOnce(() => new Promise<void>(resolve => { releaseFirst = resolve; }));
-    const wrapper = mount(HlsSelectionPreview, { props: { snapshot: makeSnapshot({ audioTrack: null }) } });
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
     try {
       await flushPromises();
       await wrapper.setProps({ snapshot: makeSnapshot({ audioTrack: null }) });
@@ -356,6 +368,99 @@ describe("HLS selection preview player", () => {
       releaseFirst();
       await flushPromises();
       expect(pause).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
+  it("replays a finished preview in place without rebuilding the session", async () => {
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
+    try {
+      await flushPromises();
+      const media = wrapper.find("video").element as HTMLVideoElement;
+      media.currentTime = 4;
+      media.dispatchEvent(new Event("timeupdate"));
+      await flushPromises();
+      expect(wrapper.text()).toContain("已到终点");
+      const applies = sent.filter(message => message.type === "preview.headers.apply").length;
+      await wrapper.find('button[aria-label="重播"]').trigger("click");
+      await flushPromises();
+      expect(hlsMock.instances).toHaveLength(1);
+      expect(sent.filter(message => message.type === "preview.headers.apply")).toHaveLength(applies);
+      expect(media.currentTime).toBe(0);
+      expect(wrapper.text()).toContain("播放中");
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
+  it("rebuilds the session when replaying after a failure", async () => {
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
+    try {
+      await flushPromises();
+      hlsMock.instances[0].emit("error", { fatal: true, type: "mediaError", details: "internalException" });
+      await flushPromises();
+      expect(wrapper.text()).toContain("预览失败");
+      await wrapper.find('button[aria-label="重新播放"]').trigger("click");
+      await flushPromises();
+      expect(hlsMock.instances).toHaveLength(2);
+      expect(wrapper.text()).toContain("播放中");
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
+  it("explains that URL keys are fetched without page credentials", async () => {
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null, keyOverride: { kind: "url", value: "https://keys.example/k.bin", iv: null } }) } });
+    try {
+      await flushPromises();
+      hlsMock.instances[0].emit("error", { fatal: true, type: "networkError", details: "keyLoadError" });
+      await flushPromises();
+      expect(wrapper.text()).toContain("不带登录信息");
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
+  it("toggles mute through an icon button", async () => {
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot({ audioTrack: null }) } });
+    try {
+      await flushPromises();
+      await wrapper.find('button[aria-label="静音"]').trigger("click");
+      expect((wrapper.find("video").element as HTMLVideoElement).muted).toBe(true);
+      expect(wrapper.find('button[aria-label="取消静音"]').attributes("aria-pressed")).toBe("true");
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
+  it("shows an idle stage with a start button and requests nothing until clicked", async () => {
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: null, poster: "https://media.example/poster.jpg", canStart: true } });
+    try {
+      await flushPromises();
+      expect(wrapper.find("video").attributes("poster")).toBe("https://media.example/poster.jpg");
+      expect(wrapper.find(".preview-controls").exists()).toBe(false);
+      expect(wrapper.find(".tag").exists()).toBe(false);
+      expect(sent).toHaveLength(0);
+      expect(trackCalls).toHaveLength(0);
+      expect(hlsMock.instances).toHaveLength(0);
+      await wrapper.get(".preview-play").trigger("click");
+      expect(wrapper.emitted("start")).toHaveLength(1);
+      expect(hlsMock.instances).toHaveLength(0);
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
+  it("disables the start button when the selection cannot be previewed", async () => {
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: null, canStart: false } });
+    try {
+      expect(wrapper.get(".preview-play").attributes("disabled")).toBeDefined();
+      await wrapper.get(".preview-play").trigger("click");
+      expect(wrapper.emitted("start")).toBeUndefined();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("returns a failed preview to the start button when the selection is withdrawn", async () => {
+    const wrapper = mount(HlsSelectionPreview, { props: { loadTrack, snapshot: makeSnapshot() } });
+    try {
+      await flushPromises();
+      expect(wrapper.text()).toContain("外置音轨比主视频长");
+      hlsMock.instances[0].emit("error", { fatal: true, type: "mediaError", details: "internalException" });
+      await flushPromises();
+      expect(wrapper.text()).toContain("预览失败");
+      await wrapper.setProps({ snapshot: null });
+      await flushPromises();
+      expect(wrapper.find(".status-banner").exists()).toBe(false);
+      expect(wrapper.find(".preview-play").text()).toBe("播放所选范围");
     } finally { wrapper.unmount(); await flushPromises(); }
   });
 });

@@ -18,20 +18,6 @@ const persistTimers = new Map();
 
 const recentRequestContexts = new Map();
 
-const pendingTextFetches = new Map();
-const cancelledTextFetches = new Map();
-const CANCEL_TOMBSTONE_MS = 30000;
-
-function pruneCancelledTextFetches() {
-  const now = Date.now();
-  for (const [key, expiry] of cancelledTextFetches) if (expiry <= now) cancelledTextFetches.delete(key);
-}
-
-function rememberCancelledTextFetch(key) {
-  pruneCancelledTextFetches();
-  cancelledTextFetches.set(key, Date.now() + CANCEL_TOMBSTONE_MS);
-}
-
 function stateKey(tabId) { return `${STATE_PREFIX}${tabId}`; }
 
 
@@ -297,7 +283,6 @@ async function addCandidate(tabId, item) {
 
 async function clearTab(tabId, pageUrl = "", remove = false) {
   if (!Number.isInteger(tabId) || tabId < 0) return;
-  abortMediaFetchesForTab(tabId);
   await queueTab(tabId, async () => {
     cancelScheduledPersist(tabId);
     for (const key of recentRequestContexts.keys()) if (key.startsWith(`${tabId}|`)) recentRequestContexts.delete(key);
@@ -423,14 +408,11 @@ async function candidateFor(tabId, id) {
   return state.candidates.get(id) || null;
 }
 
-async function readBoundedText(response, maxBytes, signal) {
-  const throwIfAborted = () => { if (signal?.aborted) throw new Error("media_fetch_cancelled"); };
-  throwIfAborted();
+async function readBoundedText(response, maxBytes) {
   const declaredLength = Number(response.headers?.get?.("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) throw new Error("media_manifest_too_large");
   if (!response.body?.getReader) {
     const text = await response.text();
-    throwIfAborted();
     if (new TextEncoder().encode(text).byteLength > maxBytes) throw new Error("media_manifest_too_large");
     return text;
   }
@@ -440,7 +422,6 @@ async function readBoundedText(response, maxBytes, signal) {
   let text = "";
   try {
     while (true) {
-      throwIfAborted();
       const { done, value } = await reader.read();
       if (done) break;
       received += value.byteLength;
@@ -449,13 +430,12 @@ async function readBoundedText(response, maxBytes, signal) {
     }
     return text + decoder.decode();
   } finally {
-    try { if (signal?.aborted) await reader.cancel(); } catch (_) {}
     reader.releaseLock?.();
   }
 }
 
 /** Resolves a candidate-owned http(s) request with the page's Referer, Origin and Authorization. */
-async function prepareOwnedFetch(tabId, id, requestedUrl, options = {}) {
+async function prepareOwnedFetch(tabId, id, requestedUrl) {
   const candidate = await candidateFor(tabId, id);
   const owner = Array.isArray(candidate) ? null : candidate;
   if (!owner) return { ok: false, error: "media_candidate_not_found" };
@@ -464,88 +444,32 @@ async function prepareOwnedFetch(tabId, id, requestedUrl, options = {}) {
   catch (_) { return { ok: false, error: "media_url_invalid" }; }
   if (!/^https?:$/.test(url.protocol)) return { ok: false, error: "media_url_unsupported" };
   if (blockedSite(url.href) || blockedSite(owner.pageUrl)) return { ok: false, error: "site_blocked" };
-  let ownerOrigin = "";
-  try { ownerOrigin = new URL(owner.url).origin; } catch (_) {}
-  const sameOrigin = !ownerOrigin || url.origin === ownerOrigin;
   const headers = new Headers();
   const pageHeaders = {};
-  // Preview-owned requests never carry candidate credentials to another origin.
-  const allowCredentials = !options.restrictOrigin || sameOrigin;
   for (const [name, value] of Object.entries(owner.requestHeaders || {})) {
     const key = name.toLowerCase();
     if (typeof value !== "string" || !value) continue;
-    if (key === "authorization" && allowCredentials) headers.set(name, value);
-    else if (["origin", "referer"].includes(key) && allowCredentials) pageHeaders[key] = value;
+    if (key === "authorization") headers.set(name, value);
+    else if (["origin", "referer"].includes(key)) pageHeaders[key] = value;
   }
-  if (allowCredentials && !pageHeaders.referer && /^https?:/i.test(owner.referer || owner.pageUrl || "")) pageHeaders.referer = owner.referer || owner.pageUrl;
+  if (!pageHeaders.referer && /^https?:/i.test(owner.referer || owner.pageUrl || "")) pageHeaders.referer = owner.referer || owner.pageUrl;
   return { ok: true, owner, url, headers, pageHeaders };
 }
 
-function abortMediaFetchesForTab(tabId) {
-  for (const [key, pending] of [...pendingTextFetches]) {
-    if (pending.tabId !== tabId) continue;
-    pendingTextFetches.delete(key);
-    try { pending.controller.abort(); } catch (_) {}
-  }
-  pruneCancelledTextFetches();
-}
-
-function cancelMediaFetch(payload = {}, sender = {}) {
-  const tabId = sender.tab?.id;
-  const requestId = typeof payload.requestId === "string" ? payload.requestId.trim().slice(0, 200) : "";
-  if (!Number.isInteger(tabId) || tabId < 0 || !requestId) return { ok: false, error: "media_cancel_invalid" };
-  const key = `${tabId}:${requestId}`;
-  const pending = pendingTextFetches.get(key);
-  if (!pending) {
-    // Cancel can outrun registration; remember it briefly so the late start aborts immediately.
-    rememberCancelledTextFetch(key);
-    return { ok: true, pending: false };
-  }
-  if (payload.sourceContextId && pending.sourceContextId && payload.sourceContextId !== pending.sourceContextId) return { ok: false, error: "media_cancel_mismatch" };
-  try { pending.controller.abort(); } catch (_) {}
-  return { ok: true, pending: true };
-}
-
-async function fetchMediaText(tabId, id, requestedUrl, options = {}) {
-  const requestId = typeof options.requestId === "string" ? options.requestId.trim().slice(0, 200) : "";
-  const sourceContextId = typeof options.sourceContextId === "string" ? options.sourceContextId : "";
-  const key = requestId && Number.isInteger(tabId) && tabId >= 0 ? `${tabId}:${requestId}` : "";
-  if (sourceContextId) {
-    const state = await loadTabState(tabId);
-    if (sourceContextId !== state.sourceContextId) return { ok: false, error: "media_context_stale" };
-  }
-  const controller = new AbortController();
-  if (key) {
-    pruneCancelledTextFetches();
-    if (cancelledTextFetches.has(key)) { cancelledTextFetches.delete(key); return { ok: false, error: "media_fetch_cancelled" }; }
-    pendingTextFetches.set(key, { controller, tabId, id, sourceContextId });
-  }
+async function fetchMediaText(tabId, id, requestedUrl) {
+  const prepared = await prepareOwnedFetch(tabId, id, requestedUrl);
+  if (!prepared.ok) return prepared;
+  const { url, headers, pageHeaders } = prepared;
+  // Fetch drops Referer and Origin as forbidden headers, so a short-lived session rule supplies them.
+  const removeRule = await applyFetchHeaders(url, pageHeaders);
   try {
-    const prepared = await prepareOwnedFetch(tabId, id, requestedUrl, { restrictOrigin: Boolean(options.restrictOrigin ?? requestId) });
-    if (!prepared.ok) return prepared;
-    if (key && !pendingTextFetches.has(key)) return { ok: false, error: "media_fetch_cancelled" };
-    if (controller.signal.aborted) return { ok: false, error: "media_fetch_cancelled" };
-    const { url, headers, pageHeaders } = prepared;
-    // Fetch drops Referer and Origin as forbidden headers, so a short-lived session rule supplies them.
-    const removeRule = await applyFetchHeaders(url, pageHeaders);
-    try {
-      if (controller.signal.aborted) return { ok: false, error: "media_fetch_cancelled" };
-      const response = await fetch(url.href, { headers, credentials: "include", redirect: "follow", ...(key ? { signal: controller.signal } : {}) });
-      if (!response.ok) return { ok: false, error: "media_fetch_failed", status: response.status };
-      let text;
-      try { text = await readBoundedText(response, 4 * 1024 * 1024, key ? controller.signal : undefined); }
-      catch (error) {
-        if (error?.message === "media_fetch_cancelled" || controller.signal.aborted) return { ok: false, error: "media_fetch_cancelled" };
-        return { ok: false, error: error.message === "media_manifest_too_large" ? error.message : "media_fetch_failed" };
-      }
-      return { ok: true, url: response.url || url.href, text };
-    } catch (error) {
-      if (error?.name === "AbortError" || controller.signal.aborted) return { ok: false, error: "media_fetch_cancelled" };
-      return { ok: false, error: "media_fetch_failed" };
-    } finally { await removeRule(); }
-  } finally {
-    if (key && pendingTextFetches.get(key)?.controller === controller) pendingTextFetches.delete(key);
-  }
+    const response = await fetch(url.href, { headers, credentials: "include", redirect: "follow" });
+    if (!response.ok) return { ok: false, error: "media_fetch_failed", status: response.status };
+    let text;
+    try { text = await readBoundedText(response, 4 * 1024 * 1024); }
+    catch (error) { return { ok: false, error: error.message === "media_manifest_too_large" ? error.message : "media_fetch_failed" }; }
+    return { ok: true, url: response.url || url.href, text };
+  } finally { await removeRule(); }
 }
 
 /**
@@ -626,5 +550,5 @@ async function clearExtracted() {
     updateBadge(state); notifyUiContext(tabId);
   });
 }
-return { refreshBadgeForContext, subscribeCandidates(listener) { candidateListeners.add(listener); return () => candidateListeners.delete(listener); }, clearExtracted, reevaluate, loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText, cancelMediaFetch, abortMediaFetchesForTab, probeMediaSize, setPageFocus };
+return { refreshBadgeForContext, subscribeCandidates(listener) { candidateListeners.add(listener); return () => candidateListeners.delete(listener); }, clearExtracted, reevaluate, loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText, probeMediaSize, setPageFocus };
 }

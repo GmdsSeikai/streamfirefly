@@ -30,7 +30,7 @@ StreamFirefly ships in two editions built from the same source:
 
 - Finds media URLs in network requests, response types, media elements, JSON/text bodies and inline scripts, and parses HLS manifests that pages build in memory through POST, Blob or script. Manifests that loaded before StreamFirefly was opened are picked up from the page's resource timing when you open it.
 - Downloads plain files over 1–16 parallel Range connections and resumes each part after a pause. Falls back to a single connection when the server does not support ranges.
-- For HLS, choose the quality, external audio, subtitles and a time or segment range. Standard AES-128 is supported. Streams are merged without re-encoding; audio-only streams are saved as M4A. The parser page can play the selected range first via "播放所选范围" (Play selected range) so you can confirm it before creating a download.
+- For HLS, choose the quality, external audio, subtitles and a time or segment range. Standard AES-128 is supported. Streams are merged without re-encoding; audio-only streams are saved as M4A. The parser page can preview the selected range before downloading.
 - Records HLS live streams, with manual start, pause and stop.
 - Downloads DASH on demand (experimental): one video and one audio track, saved as MP4 or MKV.
 - Queues tasks in order and runs at most two at a time. Recoverable tasks continue automatically after the helper restarts.
@@ -119,12 +119,6 @@ cargo build --release --manifest-path native-host/Cargo.toml
 4. The Downloads tab shows progress and lets you pause, resume, retry or delete tasks.
 
 By default, sniffing only runs while StreamFirefly is open. If the list is empty, play the video first. If it is still empty, reload the page and open StreamFirefly again, or set sniffing to "always" in the settings.
-
-### Previewing the selected range
-
-- On the HLS parser page, pick quality, audio and a range, then click "播放所选范围" (Play selected range). Opening the page or changing the selection never starts playback; clicking again rebuilds the preview with the latest selection.
-- The preview plays the selected main-video range with its matching audio on whole segments, and the progress bar shows `0..selected duration`. When the external audio track is longer, playback stops at the main video's end; the download merge is not truncated, so the saved file may keep a longer audio tail.
-- Changing the range, quality, audio or key stops the previous preview immediately. Going back, switching tabs or collapsing the workspace releases the player and it will not resume on its own. A preview failure never blocks downloads.
 
 > **Tip: turn on deep search.** Deep search is off by default. When it is on, StreamFirefly also finds video manifests that pages generate with scripts, so more resources show up. On the Resources tab, click the radar icon in the toolbar → **开启深搜** (Turn on), then reload the page. Tick **记住此站点** (Remember this site) for sites you use often.
 

@@ -74,37 +74,26 @@ function absolute(value: string, baseUrl: string): string {
   return new URL(value, baseUrl).href;
 }
 
-const byteRangePattern = /^(\d+)(?:@(\d+))?$/;
-
-function parseByteRangeParts(value: string): { length: number; offset: number | null } {
-  const match = byteRangePattern.exec(value.trim());
-  if (!match) throw new Error("ByteRange 格式无效");
-  const length = Number(match[1]);
-  if (!Number.isSafeInteger(length) || length <= 0) throw new Error("ByteRange 长度无效");
-  let offset: number | null = null;
-  if (match[2] !== undefined) {
-    offset = Number(match[2]);
-    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("ByteRange 偏移无效");
+/**
+ * Normalizes an `#EXT-X-BYTERANGE` value to the explicit `n@o` form. An implicit offset
+ * continues the previous sub-range of the same resource (starting at 0 for the first
+ * one), so a derived playlist never begins with a dangling offset-less range that the
+ * native host would reject with `hls_byte_range_offset_missing`.
+ */
+function normalizeByteRange(raw: string, uri: string, offsets: Map<string, number>): string {
+  const separator = raw.indexOf("@");
+  const length = Number.parseInt(separator >= 0 ? raw.slice(0, separator) : raw, 10);
+  if (!Number.isFinite(length) || length <= 0) return raw;
+  let start: number;
+  if (separator >= 0) {
+    const explicit = Number.parseInt(raw.slice(separator + 1), 10);
+    if (!Number.isFinite(explicit) || explicit < 0) return raw;
+    start = explicit;
+  } else {
+    start = offsets.get(uri) ?? 0;
   }
-  return { length, offset };
-}
-
-// RFC 8216 §4.3.2.2: an implicit offset continues the immediately preceding
-// media segment's sub-range of the same resource; anything else is a parse failure.
-function normalizeSegmentByteRange(value: string, previous: { uri: string; byteRange: string | null } | null, uri: string): string {
-  const { length, offset } = parseByteRangeParts(value);
-  if (offset !== null) return `${length}@${offset}`;
-  if (!previous || previous.uri !== uri || !previous.byteRange) throw new Error("ByteRange 缺少前序切片偏移");
-  const preceding = parseByteRangeParts(previous.byteRange);
-  return `${length}@${preceding.offset! + preceding.length}`;
-}
-
-// RFC 8216 §4.3.2.5 delegates only the n[@o] format to §4.3.2.2; the implicit-offset
-// rule references Media Segments and does not apply to EXT-X-MAP, so a missing offset
-// starts at the resource origin (same as hls.js setInitSegment).
-function normalizeMapByteRange(value: string): string {
-  const { length, offset } = parseByteRangeParts(value);
-  return `${length}@${offset ?? 0}`;
+  offsets.set(uri, start + length);
+  return `${length}@${start}`;
 }
 
 export function parseAttributes(input: string): Record<string, string> {
@@ -151,6 +140,8 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
   let timeline = 0;
   let hasLowLatencyParts = false;
   let hasDrmKeyFormat = false;
+  const segmentRangeOffsets = new Map<string, number>();
+  const mapRangeOffsets = new Map<string, number>();
   for (const line of lines) {
     if (line.startsWith("#EXT-X-STREAM-INF:")) { pendingVariant = parseAttributes(line.slice(line.indexOf(":") + 1)); continue; }
     if (line.startsWith("#EXT-X-MEDIA:")) {
@@ -164,12 +155,7 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
     if (line.startsWith("#EXT-X-TARGETDURATION:")) { targetDuration = Number.parseFloat(line.slice(line.indexOf(":") + 1)) || null; continue; }
     if (line.startsWith("#EXT-X-KEY:")) { const item = parseAttributes(line.slice(line.indexOf(":") + 1)); const keyFormat = item.KEYFORMAT || null; if (keyFormat && keyFormat !== "identity") hasDrmKeyFormat = true; currentKey = { method: item.METHOD || "NONE", uri: item.URI ? absolute(item.URI, baseUrl) : null, iv: item.IV || null, keyFormat }; continue; }
     if (line.startsWith("#EXT-X-PART:") || line.startsWith("#EXT-X-PRELOAD-HINT:")) { hasLowLatencyParts = true; continue; }
-    if (line.startsWith("#EXT-X-MAP:")) {
-      if (currentKey?.method === "AES-128" && !currentKey.iv) throw new Error("加密 MAP 需要显式 IV");
-      const item = parseAttributes(line.slice(line.indexOf(":") + 1));
-      if (item.URI) initMap = { uri: absolute(item.URI, baseUrl), byteRange: item.BYTERANGE ? normalizeMapByteRange(item.BYTERANGE) : null };
-      continue;
-    }
+    if (line.startsWith("#EXT-X-MAP:")) { const item = parseAttributes(line.slice(line.indexOf(":") + 1)); if (item.URI) { const mapUri = absolute(item.URI, baseUrl); initMap = { uri: mapUri, byteRange: item.BYTERANGE ? normalizeByteRange(item.BYTERANGE, mapUri, mapRangeOffsets) : null }; } continue; }
     if (line === "#EXT-X-DISCONTINUITY") { discontinuity = true; continue; }
     if (line === "#EXT-X-ENDLIST") { endList = true; continue; }
     if (line.startsWith("#")) continue;
@@ -180,10 +166,9 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
       continue;
     }
     const duration = Number.isFinite(pendingDuration) ? Math.max(0, pendingDuration as number) : 0;
-    const uri = absolute(line, baseUrl);
-    const previous = segments.length ? segments[segments.length - 1] : null;
-    const byteRange = pendingByteRange ? normalizeSegmentByteRange(pendingByteRange, previous, uri) : null;
-    segments.push({ index: segments.length, sequence: mediaSequence + segments.length, uri, duration, title: pendingTitle, byteRange, key: currentKey, initMap, discontinuity, start: timeline, end: timeline + duration });
+    const segmentUri = absolute(line, baseUrl);
+    const byteRange = pendingByteRange != null ? normalizeByteRange(pendingByteRange, segmentUri, segmentRangeOffsets) : null;
+    segments.push({ index: segments.length, sequence: mediaSequence + segments.length, uri: segmentUri, duration, title: pendingTitle, byteRange, key: currentKey, initMap, discontinuity, start: timeline, end: timeline + duration });
     timeline += duration;
     pendingDuration = null; pendingTitle = ""; pendingByteRange = null; discontinuity = false;
   }
@@ -207,9 +192,6 @@ export function chooseHlsContainer(codecs: string | null | undefined): "mp4" | "
 
 export function segmentRangeForTime(manifest: HlsManifest, start: number, end: number): [number, number] {
   if (!manifest.segments.length) return [0, 0];
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return [0, -1];
-  const lastIndex = manifest.segments.length - 1;
-  if (start >= manifest.duration) return [lastIndex, lastIndex];
   const safeStart = Math.max(0, Math.min(start, manifest.duration));
   const safeEnd = Math.max(safeStart, Math.min(end, manifest.duration));
   const first = manifest.segments.findIndex(segment => segment.end > safeStart);
@@ -217,7 +199,7 @@ export function segmentRangeForTime(manifest: HlsManifest, start: number, end: n
   // not (through findIndex's -1) the entire video.
   const from = first < 0 ? manifest.segments.length - 1 : first;
   const last = manifest.segments.findLastIndex(segment => segment.start < safeEnd || safeEnd === safeStart && segment.start <= safeEnd);
-  return [Math.max(0, first), Math.max(Math.max(0, first), last < 0 ? lastIndex : last)];
+  return [from, Math.max(from, last < 0 ? manifest.segments.length - 1 : last)];
 }
 
 export function validateHlsRange(manifest: HlsManifest | null, mode: "all" | "time" | "segment", values: { startTime: number; endTime: number; first: number; last: number }): string {

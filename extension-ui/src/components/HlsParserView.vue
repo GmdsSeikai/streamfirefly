@@ -56,6 +56,19 @@ const encryptionMethods = computed(() => hlsEncryptionMethods(videoManifest.valu
 const unsupportedEncryption = computed(() => encryptionMethods.value.find(method => method !== "AES-128") || "");
 const unsupportedLiveFeature = computed(() => videoManifest.value?.hasDrmKeyFormat ? "此直播使用 DRM 密钥格式，流萤不会尝试绕过。" : videoManifest.value?.hasLowLatencyParts ? "此直播使用 LL-HLS Part，Beta 3 暂不支持录制。" : "");
 const keyError = computed(() => keyMode.value === "manual" ? validateHlsKeyOverride(keyForm.kind, keyForm.value, keyForm.iv) : "");
+const timelineSegments = computed(() => (videoManifest.value?.segments || []).slice(0, 160));
+// In time mode, marks the typed start and end inside the segment blocks they fall in, so the snap to whole segments is visible.
+const timeMarkers = computed(() => {
+  const segments = videoManifest.value?.segments;
+  if (rangeMode.value !== "time" || !segments?.length || rangeError.value) return [];
+  const duration = videoManifest.value!.duration;
+  return ([["start", range.startTime], ["end", range.endTime]] as const).map(([edge, value]) => {
+    const time = Math.min(Math.max(value, 0), duration);
+    const segment = segments.find(item => edge === "start" ? time < item.end : time <= item.end) || segments[segments.length - 1];
+    const offset = segment.duration > 0 ? Math.min(100, Math.max(0, (time - segment.start) / segment.duration * 100)) : 0;
+    return { edge, index: segment.index, offset };
+  });
+});
 const previewSnapshot = ref<HlsSelectionSnapshot | null>(null);
 watch([selectedVariantId, selectedAudioId, rangeMode, () => range.startTime, () => range.endTime, () => range.first, () => range.last, keyMode, () => keyForm.kind, () => keyForm.value, () => keyForm.iv, videoManifest], () => { previewSnapshot.value = null; });
 
@@ -112,17 +125,13 @@ function resetRange() {
 
 watch(selectedVariantId, () => { void loadVariant(); });
 watch(() => [range.startTime, range.endTime], () => {
-  if (rangeMode.value !== "time" || !videoManifest.value) return;
-  const resolved = segmentRangeForTime(videoManifest.value, range.startTime, range.endTime);
-  if (resolved[1] < resolved[0]) return;
-  [range.first, range.last] = resolved;
+  if (rangeMode.value !== "time" || !videoManifest.value || rangeError.value) return;
+  [range.first, range.last] = segmentRangeForTime(videoManifest.value, range.startTime, range.endTime);
 });
 watch(() => [range.first, range.last], () => {
-  if (rangeMode.value !== "segment" || !videoManifest.value?.segments.length) return;
-  if (!Number.isInteger(range.first) || !Number.isInteger(range.last) || range.last < range.first) return;
-  const segments = videoManifest.value.segments;
-  const first = segments[Math.max(0, Math.min(range.first, segments.length - 1))];
-  const last = segments[Math.max(first.index, Math.min(range.last, segments.length - 1))];
+  if (rangeMode.value !== "segment" || !videoManifest.value?.segments.length || rangeError.value) return;
+  const first = videoManifest.value.segments[Math.max(0, Math.min(range.first, videoManifest.value.segments.length - 1))];
+  const last = videoManifest.value.segments[Math.max(first.index, Math.min(range.last, videoManifest.value.segments.length - 1))];
   range.startTime = first.start; range.endTime = last.end;
 });
 
@@ -216,18 +225,18 @@ function previewManifest(url: string) {
         <div class="panel-title"><div><h3>切片与时间范围</h3><p>范围按完整切片边界执行</p></div><span v-if="videoManifest" class="tag">{{ videoManifest.segments.length }} 个切片</span></div>
         <div v-if="!isLive" class="range-tabs"><button v-for="mode in [['all','全部'],['time','按时间'],['segment','按切片']]" :key="mode[0]" type="button" :class="{ active: rangeMode === mode[0] }" @click="rangeMode = mode[0] as any">{{ mode[1] }}</button></div>
         <div v-if="videoManifest?.segments.length && !isLive" class="range-body">
-          <div class="timeline"><i v-for="segment in videoManifest.segments.slice(0, 160)" :key="segment.index" :class="{ selected: actualRange && segment.index >= actualRange.first && segment.index <= actualRange.last }" :style="{ flexGrow: Math.max(.2, segment.duration) }"></i></div>
+          <div class="timeline"><i v-for="segment in timelineSegments" :key="segment.index" :class="{ selected: actualRange && segment.index >= actualRange.first && segment.index <= actualRange.last }" :style="{ flexGrow: Math.max(.2, segment.duration) }"><b v-for="marker in timeMarkers.filter(item => item.index === segment.index)" :key="marker.edge" class="timeline-marker" :style="{ left: `${marker.offset}%` }"></b></i></div>
+          <div class="timeline-scale"><span>00:00</span><span>{{ formatDuration(timelineSegments[timelineSegments.length - 1].end) }}{{ timelineSegments.length < videoManifest.segments.length ? ` · 仅显示前 ${timelineSegments.length} 个切片` : '' }}</span></div>
+          <HlsSelectionPreview :snapshot="previewSnapshot" :load-track="loadTrack" :poster="candidate.poster || null" :can-start="!(loading || form.busy || rangeError || unsupportedEncryption || keyError)" @start="startPreview" />
           <div v-if="rangeMode === 'time'" class="range-inputs"><label><span>开始时间（秒）</span><input v-model.number="range.startTime" class="control" type="number" min="0" :max="videoManifest.duration" step="0.1"></label><label><span>结束时间（秒）</span><input v-model.number="range.endTime" class="control" type="number" :min="range.startTime" :max="videoManifest.duration" step="0.1"></label></div>
           <div v-if="rangeMode === 'segment'" class="range-inputs"><label><span>起始切片</span><input v-model.number="range.first" class="control" type="number" min="0" :max="videoManifest.segments.length - 1"></label><label><span>结束切片</span><input v-model.number="range.last" class="control" type="number" :min="range.first" :max="videoManifest.segments.length - 1"></label></div>
           <dl v-if="actualRange" class="range-summary"><div><dt>清单总时长</dt><dd>{{ formatDuration(videoManifest.duration) }}</dd></div><div><dt>实际下载范围</dt><dd>{{ formatDuration(actualRange.actualStart) }} — {{ formatDuration(actualRange.actualEnd) }}</dd></div><div><dt>实际切片</dt><dd>#{{ actualRange.first }} — #{{ actualRange.last }}（{{ actualRange.count }} 个）</dd></div><div><dt>预计时长</dt><dd>{{ formatDuration(actualRange.actualEnd - actualRange.actualStart) }}</dd></div></dl>
           <p v-if="rangeError" class="inline-error">{{ rangeError }}</p>
-          <div class="preview-entry"><button class="button" type="button" :disabled="loading || form.busy || !advancedSupported || Boolean(rangeError) || Boolean(unsupportedEncryption) || Boolean(keyError) || (keyMode === 'manual' && !keyOverrideSupported)" @click="startPreview">播放所选范围</button></div>
         </div>
         <div v-else-if="isLive" class="empty-state"><span><SfIcon name="broadcast" :size="22" /></span><h3>直播录制模式</h3><p>当前窗口已有 {{ videoManifest?.segments.length || 0 }} 个切片；开始后会自动轮询并去重保存。</p></div>
         <div v-else-if="!loading" class="empty-state"><span><SfIcon name="alert-triangle" :size="22" /></span><h3>没有可用切片</h3><p>此清单没有可下载的完整媒体切片。</p></div>
       </section>
     </div>
-    <HlsSelectionPreview v-if="previewSnapshot" :snapshot="previewSnapshot" />
     <details class="panel encryption-panel">
       <summary><span><strong>加密与密钥</strong><small>{{ encryptionMethods.length ? `检测到 ${encryptionMethods.join('、')}` : '当前所选画质未检测到加密' }}</small></span><SfIcon name="chevron-down" /></summary>
       <div class="encryption-body">

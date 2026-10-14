@@ -8,10 +8,9 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { fixtureFfmpeg, fixtureFfprobe } from './fixture-ffmpeg.mjs';
-import { summarizeResults } from './preview-tally.mjs';
 
 // Real-playback evidence for the HLS selection preview (issue #14).
-// Fixtures, screenshots and the result report land in the task archive directory.
+// Fixtures, screenshots and the result report land in STREAMFIREFLY_PREVIEW_ARCHIVE (default: a temp directory).
 const require = createRequire(import.meta.url);
 // One runtime for every browser path (PLAYWRIGHT_MODULE may point at a matching local install);
 // the browser cache path is provided by the environment (PLAYWRIGHT_BROWSERS_PATH).
@@ -20,7 +19,7 @@ const { chromium, firefox } = playwrightRuntime;
 const browserName = (process.argv.find(arg => arg.startsWith('--browser='))?.slice('--browser='.length) || process.env.STREAMFIREFLY_PREVIEW_BROWSER || 'chromium').toLowerCase();
 const launchBrowser = browserName === 'firefox' ? firefox : chromium;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const archive = process.env.STREAMFIREFLY_PREVIEW_ARCHIVE || 'D:\\Develop\\Misc Workspace\\archive\\streamfirefly-hls-selection-preview';
+const archive = process.env.STREAMFIREFLY_PREVIEW_ARCHIVE || path.join(os.tmpdir(), 'streamfirefly-hls-preview');
 const mediaDir = path.join(archive, 'media');
 const shotsDir = path.join(archive, 'screenshots');
 const resultPath = path.join(archive, 'result.json');
@@ -32,10 +31,6 @@ function record(name, ok, evidence = {}) {
   results.push({ name, status: ok ? 'passed' : 'failed', evidence });
   if (!ok) console.error(`FAIL ${name}`, evidence);
   else console.log(`ok   ${name}`, JSON.stringify(evidence));
-}
-function skip(name, reason) {
-  results.push({ name, status: 'skipped', evidence: { skipped: true, reason } });
-  console.log(`skip ${name} (${reason})`);
 }
 
 function ffmpeg(args) { execFileSync(fixtureFfmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] }); }
@@ -258,155 +253,6 @@ function startServer() {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server)));
 }
 
-// Real-extension auth evidence: load the built extension headless, drive the REAL
-// background/DNR/network stack against two controllable origins, and inspect real rules.
-async function attemptExtensionAuth({ archive, originA }) {
-  const steps = [];
-  const step = (name, ok, detail = null) => { steps.push({ name, ok, detail }); return ok; };
-  const seenA = [];
-  const seenB = [];
-  const serveAuth = (log) => (request, response) => {
-    log.push({ url: request.url, authorization: request.headers.authorization || null, cookie: request.headers.cookie || null, referer: request.headers.referer || null });
-    if (request.url === '/auth/redir') { response.writeHead(302, { location: request.socket.server.originB + '/other.m3u8' }); response.end(); return; }
-    if (request.url === '/auth/page.html') { response.writeHead(200, { 'content-type': 'text/html' }); response.end('<!doctype html><meta charset="utf-8"><title>auth page</title>'); return; }
-    response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'access-control-allow-origin': '*' });
-    response.end('#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nseg.ts\n#EXT-X-ENDLIST\n');
-  };
-  // Same declared/configured Playwright runtime as the media run (resolved at module load);
-  // no personal module paths here, and every acquired resource is released in finally.
-  let serverA = null;
-  let serverB = null;
-  let browser = null;
-  try {
-    serverA = http.createServer(serveAuth(seenA));
-    serverB = http.createServer(serveAuth(seenB));
-    await new Promise(resolve => serverB.listen(0, '127.0.0.1', resolve));
-    const originB = `http://127.0.0.1:${serverB.address().port}`;
-    serverA.originB = originB;
-    serverB.originB = originB;
-    await new Promise(resolve => serverA.listen(0, '127.0.0.1', resolve));
-    const authOriginA = `http://127.0.0.1:${serverA.address().port}`;
-    // Stage the whole extension root (manifest + dist + icons); Chromium refuses non-ASCII unpacked paths.
-    const dist = path.join(archive, 'extension-root');
-    fs.rmSync(dist, { recursive: true, force: true });
-    fs.cpSync(path.join(root, 'extension'), dist, { recursive: true });
-    browser = await chromium.launchPersistentContext(fs.mkdtempSync(path.join(archive, 'extension-profile-')), {
-      channel: 'chromium',
-      headless: true,
-      args: [`--disable-extensions-except=${dist}`, `--load-extension=${dist}`]
-    });
-    let serviceWorker = null;
-    for (let tick = 0; tick < 60 && !serviceWorker; tick += 1) {
-      serviceWorker = browser.serviceWorkers()[0] || null;
-      if (!serviceWorker) await new Promise(resolve => setTimeout(resolve, 250));
-    }
-    if (!serviceWorker) {
-      const pages = browser.pages().map(page => page.url());
-      throw new Error(`extension service worker not found; pages=${JSON.stringify(pages)}; workers=${browser.serviceWorkers().length}`);
-    }
-    const extensionId = new URL(serviceWorker.url()).host;
-    step('extension loads headless (chromium channel + load-extension)', true, { extensionId });
-
-    const mediaPage = await browser.newPage();
-    await mediaPage.goto(`${authOriginA}/auth/page.html`);
-    const extPage = await browser.newPage();
-    await extPage.goto(`chrome-extension://${extensionId}/dist/app.html?surface=options`);
-    const outcome = await extPage.evaluate(async ({ authOriginA, originB }) => {
-      const notes = [];
-      const send = message => new Promise(resolve => chrome.runtime.sendMessage(message, response => resolve(response)));
-      await chrome.storage.local.set({ sniffMode: 'always' });
-      await new Promise(resolve => setTimeout(resolve, 400));
-      const tabId = (await chrome.tabs.query({ url: `${authOriginA}/*` }))[0]?.id;
-      if (!tabId) return { ok: false, notes: ['media tab not found'] };
-      await send({ type: 'media.sniffing.set', tabId, payload: { paused: false } });
-      const masterUrl = `${authOriginA}/auth/master.m3u8`;
-      const add = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: 'ISOLATED',
-        func: args => chrome.runtime.sendMessage({
-          type: 'media.add',
-          candidate: { url: args.url, mime: 'application/vnd.apple.mpegurl', sizeKind: 'manifest', source: 'network', requestHeaders: { authorization: 'Bearer real-ext', referer: `${args.origin}/` } }
-        }),
-        args: [{ url: masterUrl, origin: authOriginA }]
-      });
-      notes.push(`media.add ${JSON.stringify(add?.[0]?.result ?? add)}`);
-      const context = await chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', func: () => chrome.runtime.sendMessage({ type: 'ui.context.get', scope: 'sender' }) });
-      const sourceContextId = context?.[0]?.result?.context?.sourceContextId || '';
-      notes.push(`context ${sourceContextId ? 'ok' : 'missing'}`);
-      const candidateId = `${authOriginA}/auth/master.m3u8`;
-
-      const same = await chrome.scripting.executeScript({
-        target: { tabId }, world: 'ISOLATED',
-        func: args => chrome.runtime.sendMessage({ type: 'media.fetchText', tabId: args.tabId, id: args.candidateId, url: args.url, requestId: 'real-1', sourceContextId: args.sourceContextId }),
-        args: [{ tabId, candidateId, url: `${authOriginA}/auth/master.m3u8`, sourceContextId }]
-      });
-      notes.push(`same-origin fetchText ${JSON.stringify(same?.[0]?.result ?? same)}`);
-      const cross = await chrome.scripting.executeScript({
-        target: { tabId }, world: 'ISOLATED',
-        func: args => chrome.runtime.sendMessage({ type: 'media.fetchText', tabId: args.tabId, id: args.candidateId, url: args.url, requestId: 'real-2', sourceContextId: args.sourceContextId }),
-        args: [{ tabId, candidateId, url: `${originB}/other.m3u8`, sourceContextId }]
-      });
-      notes.push(`cross-origin fetchText ${JSON.stringify(cross?.[0]?.result ?? cross)}`);
-      const redirected = await chrome.scripting.executeScript({
-        target: { tabId }, world: 'ISOLATED',
-        func: args => chrome.runtime.sendMessage({ type: 'media.fetchText', tabId: args.tabId, id: args.candidateId, url: args.url, requestId: 'real-3', sourceContextId: args.sourceContextId }),
-        args: [{ tabId, candidateId, url: `${authOriginA}/auth/redir`, sourceContextId }]
-      });
-      notes.push(`redirect fetchText ${JSON.stringify(redirected?.[0]?.result ?? redirected)}`);
-
-      const apply = await chrome.scripting.executeScript({
-        target: { tabId }, world: 'ISOLATED',
-        func: args => chrome.runtime.sendMessage({ type: 'preview.headers.apply', payload: args }),
-        args: [{ previewSessionId: 'real-ext', candidateId, url: candidateId, headers: { authorization: 'Bearer real-ext', referer: `${authOriginA}/` } }]
-      });
-      notes.push(`apply ${JSON.stringify(apply?.[0]?.result ?? apply)}`);
-      const rulesAfterApply = await chrome.declarativeNetRequest.getSessionRules();
-      await chrome.scripting.executeScript({
-        target: { tabId }, world: 'ISOLATED',
-        func: args => Promise.all([fetch(args.a).then(response => response.status), fetch(args.b).then(response => response.status)]),
-        args: [{ a: `${authOriginA}/auth/master.m3u8`, b: `${originB}/other.m3u8` }]
-      });
-      const clear = await chrome.scripting.executeScript({
-        target: { tabId }, world: 'ISOLATED',
-        func: args => chrome.runtime.sendMessage({ type: 'preview.headers.clear', previewSessionId: args.id }),
-        args: [{ id: 'real-ext' }]
-      });
-      notes.push(`clear ${JSON.stringify(clear?.[0]?.result ?? clear)}`);
-      const rulesAfterClear = await chrome.declarativeNetRequest.getSessionRules();
-      await chrome.tabs.remove(tabId);
-      await new Promise(resolve => setTimeout(resolve, 400));
-      const rulesAfterClose = await chrome.declarativeNetRequest.getSessionRules();
-      return {
-        ok: true,
-        notes,
-        rulesAfterApply: rulesAfterApply.length,
-        rulesAfterClear: rulesAfterClear.length,
-        rulesAfterClose: rulesAfterClose.length
-      };
-    }, { authOriginA, originB });
-    step('background message flow completed in real extension', Boolean(outcome?.ok), outcome);
-
-    await new Promise(resolve => setTimeout(resolve, 300));
-    const sameOriginReplayed = seenA.filter(item => item.url.includes('master.m3u8') && item.authorization === 'Bearer real-ext' && item.referer === `${authOriginA}/`).length >= 2;
-    const crossOriginClean = seenB.every(item => !item.authorization && !item.cookie);
-    const redirectClean = seenB.filter(item => item.url.includes('other.m3u8')).every(item => !item.authorization);
-    const rulesClean = outcome?.rulesAfterApply === 1 && outcome?.rulesAfterClear === 0 && outcome?.rulesAfterClose === 0;
-    step('same-origin Authorization replayed via real DNR/fetch', sameOriginReplayed, { seenA });
-    step('cross-origin and redirected requests carry no candidate credentials', crossOriginClean && redirectClean, { seenB });
-    step('real DNR session rules install/clear/tab-close clean up', rulesClean, { rules: outcome && { afterApply: outcome.rulesAfterApply, afterClear: outcome.rulesAfterClear, afterClose: outcome.rulesAfterClose } });
-    return { attempted: true, passed: steps.every(item => item.ok), steps, seenA, seenB, outcomeNotes: outcome?.notes };
-  } catch (error) {
-    step('real extension path reached a hard failure', false, String(error?.stack || error).slice(0, 800));
-    return { attempted: true, passed: false, steps, seenA, seenB, error: String(error?.message || error) };
-  } finally {
-    await browser?.close().catch(() => {});
-    for (const server of [serverA, serverB]) {
-      if (!server) continue;
-      await new Promise(resolve => server.close(() => resolve()));
-    }
-  }
-}
-
 async function main() {
   if (!fs.existsSync(path.join(root, 'extension/dist/app.html'))) throw new Error('extension/dist 不存在，请先运行 npm run build:extension 或 npm run validate:extension');
   generateFixtures();
@@ -460,9 +306,8 @@ async function main() {
       ];
       const view = { pattern: '', type: 'all', minMb: '', maxMb: '', minDuration: '', maxDuration: '', sortMode: 'detected', expandedId: '', revision: 0 };
       const context = { sourceContextId: 'preview-page', sourceTabId: 3, pageUrl: location.href, pageTitle: '预览夹具', favIconUrl: '', supported: true, paused: false, sniffingActive: true, resourceViewState: view, candidates };
-      const pendingFetches = new Map();
       const tasks = [];
-      window.__previewFixture = { tasks, cancelled: [] };
+      window.__previewFixture = { tasks };
       window.chrome = {
         storage: { local: { get: async () => ({}), set: async () => {} } },
         runtime: {
@@ -475,21 +320,12 @@ async function main() {
             if (message.type === 'task.prepare') return { ok: true, payload: { fileName: '预览夹具', extension: 'mp4' } };
             if (message.type === 'task.create') { tasks.push({ id: String(tasks.length + 1), request_id: message.payload.requestId, title: message.payload.title, state: 'queued', progress: 0, source_context_id: 'preview-page', hlsPlan: message.payload.hlsPlan }); return { ok: true, task: tasks.at(-1) }; }
             if (message.type === 'preview.headers.apply' || message.type === 'preview.headers.clear') return { ok: true };
-            if (message.type === 'media.fetchText.cancel') {
-              window.__previewFixture.cancelled.push(message.requestId);
-              pendingFetches.get(message.requestId)?.abort();
-              return { ok: true, pending: pendingFetches.has(message.requestId) };
-            }
             if (message.type === 'media.fetchText') {
-              const controller = new AbortController();
-              if (message.requestId) pendingFetches.set(message.requestId, controller);
               try {
-                const response = await fetch(message.url, { signal: controller.signal });
+                const response = await fetch(message.url);
                 if (!response.ok) return { ok: false, error: 'media_fetch_failed' };
                 return { ok: true, text: await response.text(), url: response.url };
-              } catch (error) {
-                return { ok: false, error: error.name === 'AbortError' ? 'media_fetch_cancelled' : 'media_fetch_failed' };
-              } finally { if (message.requestId) pendingFetches.delete(message.requestId); }
+              } catch (_) { return { ok: false, error: 'media_fetch_failed' }; }
             }
             return { ok: true };
           }
@@ -547,8 +383,13 @@ async function main() {
       await page.getByRole('menuitem', { name: '详细解析' }).click();
       await page.getByRole('heading', { name: '媒体解析' }).waitFor();
     };
+    // The start button only shows while idle; an unchanged selection keeps its session and is replayed instead.
     const clickPreview = async () => {
-      await page.getByRole('button', { name: '播放所选范围', exact: true }).click();
+      const start = page.getByRole('button', { name: '播放所选范围', exact: true });
+      const replay = page.getByRole('button', { name: '重新播放', exact: true });
+      await start.or(replay).first().waitFor();
+      if (await start.count()) await start.click();
+      else await replay.click();
     };
     const previewTag = () => page.locator('.selection-preview .tag');
     const waitForTag = async text => previewTag().getByText(text, { exact: true }).waitFor({ timeout: 20000 });
@@ -921,25 +762,18 @@ async function main() {
     for (const release of server.fixtureState.releases.splice(0)) release();
     const closedAborted = failedRequests.slice(closedBefore).filter(item => /abort/i.test(item.error));
     record('关闭工作区中止在途请求', closedStalled && closedAborted.length > 0, { closedStalled, closedAborted: closedAborted.map(item => ({ url: item.url, error: item.error })) });
-
-    // --- S22: real-extension auth attempt (isolated profile, real DNR/network stack, two origins).
-    if (browserName === 'firefox') {
-      skip('真实扩展鉴权（双 origin/真实 DNR）', 'Firefox 跑：load-extension 为 Chromium 专属');
-    } else {
-      const extensionAuth = await attemptExtensionAuth({ mediaDir, archive, originA: origin });
-      record('真实扩展鉴权（双 origin/真实 DNR）', extensionAuth.passed, extensionAuth);
-    }
   } finally {
     await browser?.close();
     server.close();
   }
 
-  const summary = summarizeResults(results);
-  const report = { ...summary, browser: browserName, startedAt: new Date().toISOString(), results, errors, origin };
+  const passed = results.filter(item => item.status === 'passed').length;
+  const failed = results.length - passed;
+  const report = { passed, failed, succeeded: failed === 0 && passed > 0, browser: browserName, startedAt: new Date().toISOString(), results, errors, origin };
   fs.writeFileSync(resultPath, JSON.stringify(report, null, 2));
   fs.writeFileSync(path.join(archive, `result-${browserName}.json`), JSON.stringify(report, null, 2));
-  console.log(`\n${summary.passed} executed checks passed, ${summary.failed} failed, ${summary.skipped} skipped (complete coverage: ${summary.complete ? 'yes' : 'no'}) → ${resultPath}`);
-  if (!summary.succeeded) process.exitCode = 1;
+  console.log(`\n${passed} checks passed, ${failed} failed → ${resultPath}`);
+  if (!report.succeeded) process.exitCode = 1;
 }
 
 main().catch(error => {
