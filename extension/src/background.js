@@ -24,7 +24,7 @@ const discovery = createDiscovery(api, settings, evaluation);
 const extraction = createExtraction(api, evaluation);
 const downloadBadge = createDownloadBadge();
 const resources = createResources(api, settings, sniffing, (message, tabId) => workspace.notifyWorkspaceMessage(message, tabId), discovery.detect, extraction.extract, downloadBadge);
-const { loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText, probeMediaSize, setPageFocus } = resources;
+const { loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText, cancelMediaFetch, probeMediaSize, setPageFocus } = resources;
 sniffing.readPaused(async tabId => (await loadTabState(tabId)).paused);
 const preview = createPreview(api, resources.candidateFor);
 const { updatePreviewHeaders } = preview;
@@ -382,8 +382,12 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "media.fetchText") {
-    fetchMediaText(sender.tab?.id ?? message.tabId, message.id, message.url).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message }));
+    fetchMediaText(sender.tab?.id ?? message.tabId, message.id, message.url, { requestId: message.requestId, sourceContextId: message.sourceContextId, restrictOrigin: message.restrictOrigin }).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message }));
     return true;
+  }
+  if (message?.type === "media.fetchText.cancel") {
+    try { sendResponse(cancelMediaFetch(message, sender)); } catch (error) { sendResponse({ ok: false, error: error.message }); }
+    return false;
   }
   if (message?.type === "media.size.probe") {
     probeMediaSize(sender.tab?.id ?? message.tabId, message.sourceContextId, message.id).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message }));

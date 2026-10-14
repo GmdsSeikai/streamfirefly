@@ -74,6 +74,39 @@ function absolute(value: string, baseUrl: string): string {
   return new URL(value, baseUrl).href;
 }
 
+const byteRangePattern = /^(\d+)(?:@(\d+))?$/;
+
+function parseByteRangeParts(value: string): { length: number; offset: number | null } {
+  const match = byteRangePattern.exec(value.trim());
+  if (!match) throw new Error("ByteRange 格式无效");
+  const length = Number(match[1]);
+  if (!Number.isSafeInteger(length) || length <= 0) throw new Error("ByteRange 长度无效");
+  let offset: number | null = null;
+  if (match[2] !== undefined) {
+    offset = Number(match[2]);
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("ByteRange 偏移无效");
+  }
+  return { length, offset };
+}
+
+// RFC 8216 §4.3.2.2: an implicit offset continues the immediately preceding
+// media segment's sub-range of the same resource; anything else is a parse failure.
+function normalizeSegmentByteRange(value: string, previous: { uri: string; byteRange: string | null } | null, uri: string): string {
+  const { length, offset } = parseByteRangeParts(value);
+  if (offset !== null) return `${length}@${offset}`;
+  if (!previous || previous.uri !== uri || !previous.byteRange) throw new Error("ByteRange 缺少前序切片偏移");
+  const preceding = parseByteRangeParts(previous.byteRange);
+  return `${length}@${preceding.offset! + preceding.length}`;
+}
+
+// RFC 8216 §4.3.2.5 delegates only the n[@o] format to §4.3.2.2; the implicit-offset
+// rule references Media Segments and does not apply to EXT-X-MAP, so a missing offset
+// starts at the resource origin (same as hls.js setInitSegment).
+function normalizeMapByteRange(value: string): string {
+  const { length, offset } = parseByteRangeParts(value);
+  return `${length}@${offset ?? 0}`;
+}
+
 export function parseAttributes(input: string): Record<string, string> {
   const values: Record<string, string> = {};
   let cursor = 0;
@@ -131,7 +164,12 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
     if (line.startsWith("#EXT-X-TARGETDURATION:")) { targetDuration = Number.parseFloat(line.slice(line.indexOf(":") + 1)) || null; continue; }
     if (line.startsWith("#EXT-X-KEY:")) { const item = parseAttributes(line.slice(line.indexOf(":") + 1)); const keyFormat = item.KEYFORMAT || null; if (keyFormat && keyFormat !== "identity") hasDrmKeyFormat = true; currentKey = { method: item.METHOD || "NONE", uri: item.URI ? absolute(item.URI, baseUrl) : null, iv: item.IV || null, keyFormat }; continue; }
     if (line.startsWith("#EXT-X-PART:") || line.startsWith("#EXT-X-PRELOAD-HINT:")) { hasLowLatencyParts = true; continue; }
-    if (line.startsWith("#EXT-X-MAP:")) { const item = parseAttributes(line.slice(line.indexOf(":") + 1)); if (item.URI) initMap = { uri: absolute(item.URI, baseUrl), byteRange: item.BYTERANGE || null }; continue; }
+    if (line.startsWith("#EXT-X-MAP:")) {
+      if (currentKey?.method === "AES-128" && !currentKey.iv) throw new Error("加密 MAP 需要显式 IV");
+      const item = parseAttributes(line.slice(line.indexOf(":") + 1));
+      if (item.URI) initMap = { uri: absolute(item.URI, baseUrl), byteRange: item.BYTERANGE ? normalizeMapByteRange(item.BYTERANGE) : null };
+      continue;
+    }
     if (line === "#EXT-X-DISCONTINUITY") { discontinuity = true; continue; }
     if (line === "#EXT-X-ENDLIST") { endList = true; continue; }
     if (line.startsWith("#")) continue;
@@ -142,7 +180,10 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
       continue;
     }
     const duration = Number.isFinite(pendingDuration) ? Math.max(0, pendingDuration as number) : 0;
-    segments.push({ index: segments.length, sequence: mediaSequence + segments.length, uri: absolute(line, baseUrl), duration, title: pendingTitle, byteRange: pendingByteRange, key: currentKey, initMap, discontinuity, start: timeline, end: timeline + duration });
+    const uri = absolute(line, baseUrl);
+    const previous = segments.length ? segments[segments.length - 1] : null;
+    const byteRange = pendingByteRange ? normalizeSegmentByteRange(pendingByteRange, previous, uri) : null;
+    segments.push({ index: segments.length, sequence: mediaSequence + segments.length, uri, duration, title: pendingTitle, byteRange, key: currentKey, initMap, discontinuity, start: timeline, end: timeline + duration });
     timeline += duration;
     pendingDuration = null; pendingTitle = ""; pendingByteRange = null; discontinuity = false;
   }
@@ -166,11 +207,31 @@ export function chooseHlsContainer(codecs: string | null | undefined): "mp4" | "
 
 export function segmentRangeForTime(manifest: HlsManifest, start: number, end: number): [number, number] {
   if (!manifest.segments.length) return [0, 0];
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return [0, -1];
+  const lastIndex = manifest.segments.length - 1;
+  if (start >= manifest.duration) return [lastIndex, lastIndex];
   const safeStart = Math.max(0, Math.min(start, manifest.duration));
   const safeEnd = Math.max(safeStart, Math.min(end, manifest.duration));
   const first = manifest.segments.findIndex(segment => segment.end > safeStart);
   const last = manifest.segments.findLastIndex(segment => segment.start < safeEnd || safeEnd === safeStart && segment.start <= safeEnd);
-  return [Math.max(0, first), Math.max(Math.max(0, first), last < 0 ? manifest.segments.length - 1 : last)];
+  return [Math.max(0, first), Math.max(Math.max(0, first), last < 0 ? lastIndex : last)];
+}
+
+export function validateHlsRange(manifest: HlsManifest | null, mode: "all" | "time" | "segment", values: { startTime: number; endTime: number; first: number; last: number }): string {
+  if (!manifest || !manifest.segments.length) return "";
+  if (mode === "time") {
+    if (!Number.isFinite(values.startTime) || !Number.isFinite(values.endTime)) return "请输入有效的时间范围";
+    if (values.startTime < 0 || values.endTime < 0) return "时间范围不能为负数";
+    if (values.startTime > values.endTime) return "开始时间不能晚于结束时间";
+    return "";
+  }
+  if (mode === "segment") {
+    if (!Number.isInteger(values.first) || !Number.isInteger(values.last)) return "切片序号必须是整数";
+    if (values.first < 0 || values.last < 0) return "切片序号不能为负数";
+    if (values.first > values.last) return "起始切片不能晚于结束切片";
+    return "";
+  }
+  return "";
 }
 
 function quote(value: string): string { return `"${value.replaceAll('"', "%22")}"`; }
@@ -178,6 +239,7 @@ function quote(value: string): string { return `"${value.replaceAll('"', "%22")}
 export function deriveMediaPlaylist(manifest: HlsManifest, first: number, last: number): { text: string; baseUrl: string; first: number; last: number; actualStart: number; actualEnd: number } {
   if (manifest.live) throw new Error("直播清单请使用录制模式");
   if (!manifest.segments.length) throw new Error("清单没有可下载切片");
+  if (!Number.isInteger(first) || !Number.isInteger(last) || first < 0 || last < first) throw new Error("切片范围无效");
   const from = Math.max(0, Math.min(first, manifest.segments.length - 1));
   const to = Math.max(from, Math.min(last, manifest.segments.length - 1));
   const selected = manifest.segments.slice(from, to + 1);

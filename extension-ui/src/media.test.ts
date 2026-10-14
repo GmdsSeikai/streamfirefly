@@ -1,4 +1,4 @@
-import { betterAlternative, chooseHlsContainer, defaultAudio, defaultVariant, deriveMediaPlaylist, filterCandidates, focusedCandidateIds, hlsEncryptionMethods, isBlobCandidate, parseHls, segmentRangeForTime, sortCandidates, validateHlsKeyOverride } from "./media";
+import { betterAlternative, chooseHlsContainer, defaultAudio, defaultVariant, deriveMediaPlaylist, filterCandidates, focusedCandidateIds, hlsEncryptionMethods, isBlobCandidate, parseHls, segmentRangeForTime, sortCandidates, validateHlsKeyOverride, validateHlsRange } from "./media";
 import type { MediaCandidate } from "./types";
 
 const masterText = `#EXTM3U
@@ -157,4 +157,81 @@ test("puts covered resources first after direct downloads and finds better copie
   expect(betterAlternative(blob, [blob, hls, bare, large])).toEqual({ candidate: large, reason: "resolution" });
   expect(betterAlternative(large, [blob, hls, large])).toBeNull();
   expect(betterAlternative(bare, [bare, hls, large])).toBeNull();
+});
+
+test("normalizes implicit byte-range offsets from the immediately preceding segment", () => {
+  const manifest = parseHls(`#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXT-X-BYTERANGE:50@100
+#EXTINF:5,
+sub.ts
+#EXT-X-BYTERANGE:50
+#EXTINF:5,
+sub.ts
+#EXT-X-BYTERANGE:20@200
+#EXTINF:5,
+sub.ts
+#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(manifest.segments.map(segment => segment.byteRange)).toEqual(["50@100", "50@150", "20@200"]);
+  const derived = deriveMediaPlaylist(manifest, 1, 1);
+  expect(derived.text).toContain("#EXT-X-BYTERANGE:50@150");
+  const roundTrip = parseHls(derived.text, derived.baseUrl);
+  expect(roundTrip.segments[0].byteRange).toBe("50@150");
+});
+
+test("rejects implicit byte ranges without a usable preceding segment", () => {
+  const base = "#EXTM3U\n#EXT-X-TARGETDURATION:5\n";
+  expect(() => parseHls(`${base}#EXT-X-BYTERANGE:50\n#EXTINF:5,\nsub.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("ByteRange 缺少前序切片偏移");
+  expect(() => parseHls(`${base}#EXT-X-BYTERANGE:50@0\n#EXTINF:5,\nsub.ts\n#EXT-X-BYTERANGE:50\n#EXTINF:5,\nother.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("ByteRange 缺少前序切片偏移");
+  expect(() => parseHls(`${base}#EXTINF:5,\nsub.ts\n#EXT-X-BYTERANGE:50\n#EXTINF:5,\nsub.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("ByteRange 缺少前序切片偏移");
+});
+
+test("rejects malformed byte-range values and accepts explicit map ranges", () => {
+  const base = "#EXTM3U\n#EXT-X-TARGETDURATION:5\n";
+  expect(() => parseHls(`${base}#EXT-X-BYTERANGE:0@0\n#EXTINF:5,\nsub.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("ByteRange 长度无效");
+  expect(() => parseHls(`${base}#EXT-X-BYTERANGE:50@-1\n#EXTINF:5,\nsub.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("ByteRange 格式无效");
+  expect(() => parseHls(`${base}#EXT-X-BYTERANGE:50.5@0\n#EXTINF:5,\nsub.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("ByteRange 格式无效");
+  expect(() => parseHls(`${base}#EXT-X-BYTERANGE:50@abc\n#EXTINF:5,\nsub.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("ByteRange 格式无效");
+  const manifest = parseHls(`${base}#EXT-X-MAP:URI="init.mp4",BYTERANGE="60@0"\n#EXT-X-BYTERANGE:50@0\n#EXTINF:5,\ninit.mp4\n#EXT-X-MAP:URI="init.mp4",BYTERANGE="60"\n#EXT-X-BYTERANGE:50\n#EXTINF:5,\ninit.mp4\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(manifest.segments[0].initMap?.byteRange).toBe("60@0");
+  expect(manifest.segments[1].initMap?.byteRange).toBe("60@0");
+  expect(manifest.segments.map(segment => segment.byteRange)).toEqual(["50@0", "50@50"]);
+});
+
+test("maps time ranges safely at boundaries and for invalid input", () => {
+  const manifest = parseHls(`#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXTINF:5,
+1.ts
+#EXTINF:5,
+2.ts
+#EXTINF:5,
+3.ts
+#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(segmentRangeForTime(manifest, 0, 15)).toEqual([0, 2]);
+  expect(segmentRangeForTime(manifest, 100, 200)).toEqual([2, 2]);
+  expect(segmentRangeForTime(manifest, Number.NaN, 5)).toEqual([0, -1]);
+  expect(segmentRangeForTime(manifest, 0, Number.POSITIVE_INFINITY)).toEqual([0, -1]);
+  expect(() => deriveMediaPlaylist(manifest, Number.NaN, 1)).toThrow("切片范围无效");
+  expect(() => deriveMediaPlaylist(manifest, 2, 1)).toThrow("切片范围无效");
+  const derived = deriveMediaPlaylist(manifest, 5, 6);
+  expect([derived.first, derived.last]).toEqual([2, 2]);
+});
+
+test("rejects encrypted maps without an explicit IV", () => {
+  expect(() => parseHls(`#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXT-X-MAP:URI="init.mp4",BYTERANGE="60@0"\n#EXTINF:5,\n1.m4s\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8")).toThrow("加密 MAP 需要显式 IV");
+  const ok = parseHls(`#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00112233445566778899aabbccddeeff\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:5,\n1.m4s\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(ok.segments[0].initMap?.uri).toContain("init.mp4");
+});
+
+test("validates range inputs before building a selection", () => {
+  const manifest = parseHls(`#EXTM3U\n#EXTINF:5,\n1.ts\n#EXTINF:5,\n2.ts\n#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(validateHlsRange(manifest, "all", { startTime: Number.NaN, endTime: 0, first: 0, last: 1 })).toBe("");
+  expect(validateHlsRange(manifest, "time", { startTime: Number.NaN, endTime: 5, first: 0, last: 1 })).toContain("有效的时间");
+  expect(validateHlsRange(manifest, "time", { startTime: 5, endTime: 1, first: 0, last: 1 })).toContain("开始时间");
+  expect(validateHlsRange(manifest, "time", { startTime: -1, endTime: 5, first: 0, last: 1 })).toContain("负数");
+  expect(validateHlsRange(manifest, "segment", { startTime: 0, endTime: 5, first: 0.5, last: 1 })).toContain("整数");
+  expect(validateHlsRange(manifest, "segment", { startTime: 0, endTime: 5, first: 2, last: 1 })).toContain("不能晚于");
+  expect(validateHlsRange(manifest, "segment", { startTime: 0, endTime: 5, first: 0, last: 1 })).toBe("");
+  expect(validateHlsRange(null, "time", { startTime: Number.NaN, endTime: 0, first: 0, last: 0 })).toBe("");
 });
